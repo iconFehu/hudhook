@@ -16,7 +16,10 @@ pub(crate) trait RenderEngine: RenderContext {
 
     fn render(&mut self, draw_data: &DrawData, render_target: Self::RenderTarget) -> Result<()>;
     fn setup_fonts(&mut self, ctx: &mut Context) -> Result<()>;
-    fn update_textures(&mut self, draw_data: &DrawData) -> Result<()> {
+    fn update_textures(&mut self, draw_data: &DrawData) -> Result<()>
+    where
+        Self: Sized,
+    {
         update_textures(self, draw_data)
     }
 }

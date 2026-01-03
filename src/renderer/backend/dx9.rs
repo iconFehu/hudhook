@@ -124,6 +124,139 @@ impl RenderEngine for D3D9RenderEngine {
         };
         Ok(())
     }
+
+    fn update_textures(&mut self, draw_data: &DrawData) -> Result<()> {
+        let raw_draw_data = unsafe { draw_data.raw() };
+        let textures_ptr = raw_draw_data.Textures;
+        if textures_ptr.is_null() {
+            return Ok(());
+        }
+
+        let textures_vec = unsafe { &*textures_ptr };
+        if textures_vec.Size <= 0 || textures_vec.Data.is_null() {
+            return Ok(());
+        }
+
+        let textures =
+            unsafe { std::slice::from_raw_parts(textures_vec.Data, textures_vec.Size as usize) };
+        for &tex_ptr in textures {
+            if tex_ptr.is_null() {
+                continue;
+            }
+
+            unsafe {
+                let tex = &mut *tex_ptr;
+                let status = tex.Status;
+                if status == sys::ImTextureStatus_OK || status == sys::ImTextureStatus_Destroyed {
+                    continue;
+                }
+
+                if status == sys::ImTextureStatus_WantDestroy {
+                    sys::ImTextureData_SetTexID(tex_ptr, 0);
+                    sys::ImTextureData_SetStatus(tex_ptr, sys::ImTextureStatus_Destroyed);
+                    continue;
+                }
+
+                let width = tex.Width as u32;
+                let height = tex.Height as u32;
+                if width == 0 || height == 0 || tex.Pixels.is_null() {
+                    continue;
+                }
+
+                let pitch = sys::ImTextureData_GetPitch(tex_ptr) as usize;
+                let data = std::slice::from_raw_parts(
+                    tex.Pixels as *const u8,
+                    pitch * height as usize,
+                );
+                let bpp = tex.BytesPerPixel as usize;
+                let is_invalid = tex.TexID == 0;
+
+                if status == sys::ImTextureStatus_WantCreate || is_invalid {
+                    let texture_id = self.texture_heap.create_texture(width, height)?;
+                    self.texture_heap.upload_texture_region(
+                        texture_id,
+                        data,
+                        width,
+                        height,
+                        pitch,
+                        0,
+                        0,
+                        width,
+                        height,
+                        bpp,
+                    )?;
+                    sys::ImTextureData_SetTexID(tex_ptr, texture_id.id() as sys::ImTextureID);
+                    sys::ImTextureData_SetStatus(tex_ptr, sys::ImTextureStatus_OK);
+                    continue;
+                }
+
+                if status == sys::ImTextureStatus_WantUpdates {
+                    let texture_id = TextureId::from(tex.TexID as usize);
+                    if tex.Updates.Size > 0 && !tex.Updates.Data.is_null() {
+                        let rects = std::slice::from_raw_parts(
+                            tex.Updates.Data,
+                            tex.Updates.Size as usize,
+                        );
+                        for rect in rects {
+                            let x = rect.x as u32;
+                            let y = rect.y as u32;
+                            let w = rect.w as u32;
+                            let h = rect.h as u32;
+                            if w == 0 || h == 0 {
+                                continue;
+                            }
+                            self.texture_heap.upload_texture_region(
+                                texture_id,
+                                data,
+                                width,
+                                height,
+                                pitch,
+                                x,
+                                y,
+                                w,
+                                h,
+                                bpp,
+                            )?;
+                        }
+                    } else if tex.UpdateRect.w != 0 && tex.UpdateRect.h != 0 {
+                        let x = tex.UpdateRect.x as u32;
+                        let y = tex.UpdateRect.y as u32;
+                        let w = tex.UpdateRect.w as u32;
+                        let h = tex.UpdateRect.h as u32;
+                        self.texture_heap.upload_texture_region(
+                            texture_id,
+                            data,
+                            width,
+                            height,
+                            pitch,
+                            x,
+                            y,
+                            w,
+                            h,
+                            bpp,
+                        )?;
+                    } else {
+                        self.texture_heap.upload_texture_region(
+                            texture_id,
+                            data,
+                            width,
+                            height,
+                            pitch,
+                            0,
+                            0,
+                            width,
+                            height,
+                            bpp,
+                        )?;
+                    }
+
+                    sys::ImTextureData_SetStatus(tex_ptr, sys::ImTextureStatus_OK);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl D3D9RenderEngine {
@@ -422,6 +555,34 @@ impl TextureHeap {
         width: u32,
         height: u32,
     ) -> Result<()> {
+        let src_pitch = (width as usize) * 4;
+        self.upload_texture_region(
+            texture_id,
+            data,
+            width,
+            height,
+            src_pitch,
+            0,
+            0,
+            width,
+            height,
+            4,
+        )
+    }
+
+    unsafe fn upload_texture_region(
+        &mut self,
+        texture_id: TextureId,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        src_pitch: usize,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        bpp: usize,
+    ) -> Result<()> {
         let texture = &self.textures[texture_id.id()];
         if texture.width != width || texture.height != height {
             error!(
@@ -432,22 +593,38 @@ impl TextureHeap {
         }
 
         let mut r: D3DLOCKED_RECT = Default::default();
-        texture.resource.LockRect(0, &mut r, ptr::null_mut(), 0)?;
+        let rect = RECT {
+            left: x as i32,
+            top: y as i32,
+            right: (x + w) as i32,
+            bottom: (y + h) as i32,
+        };
+        texture.resource.LockRect(0, &mut r, &rect, 0)?;
 
         let bits = r.pBits as *mut u8;
-        let pitch = r.Pitch as usize;
-        let height = height as usize;
-        let width = width as usize;
+        let dst_pitch = r.Pitch as usize;
+        let region_height = h as usize;
+        let region_width = w as usize;
 
         // CPU swizzle FTW
-        for y in 0..height {
-            for x in 0..width {
-                let offset_dest = pitch * y + x * 4;
-                let offset_src = width * 4 * y + x * 4;
-                *bits.add(offset_dest) = data[offset_src + 2];
-                *bits.add(offset_dest + 1) = data[offset_src + 1];
-                *bits.add(offset_dest + 2) = data[offset_src];
-                *bits.add(offset_dest + 3) = data[offset_src + 3];
+        for row in 0..region_height {
+            let src_row = (y as usize + row) * src_pitch;
+            let dst_row = row * dst_pitch;
+            for col in 0..region_width {
+                let offset_dest = dst_row + col * 4;
+                let src_offset = src_row + ((x as usize + col) * bpp);
+                if bpp == 1 {
+                    let a = data[src_offset];
+                    *bits.add(offset_dest) = 255;
+                    *bits.add(offset_dest + 1) = 255;
+                    *bits.add(offset_dest + 2) = 255;
+                    *bits.add(offset_dest + 3) = a;
+                } else {
+                    *bits.add(offset_dest) = data[src_offset + 2];
+                    *bits.add(offset_dest + 1) = data[src_offset + 1];
+                    *bits.add(offset_dest + 2) = data[src_offset];
+                    *bits.add(offset_dest + 3) = data[src_offset + 3];
+                }
             }
         }
 

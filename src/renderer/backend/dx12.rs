@@ -158,6 +158,139 @@ impl RenderEngine for D3D12RenderEngine {
         };
         Ok(())
     }
+
+    fn update_textures(&mut self, draw_data: &DrawData) -> Result<()> {
+        let raw_draw_data = unsafe { draw_data.raw() };
+        let textures_ptr = raw_draw_data.Textures;
+        if textures_ptr.is_null() {
+            return Ok(());
+        }
+
+        let textures_vec = unsafe { &*textures_ptr };
+        if textures_vec.Size <= 0 || textures_vec.Data.is_null() {
+            return Ok(());
+        }
+
+        let textures =
+            unsafe { std::slice::from_raw_parts(textures_vec.Data, textures_vec.Size as usize) };
+        for &tex_ptr in textures {
+            if tex_ptr.is_null() {
+                continue;
+            }
+
+            unsafe {
+                let tex = &mut *tex_ptr;
+                let status = tex.Status;
+                if status == sys::ImTextureStatus_OK || status == sys::ImTextureStatus_Destroyed {
+                    continue;
+                }
+
+                if status == sys::ImTextureStatus_WantDestroy {
+                    sys::ImTextureData_SetTexID(tex_ptr, 0);
+                    sys::ImTextureData_SetStatus(tex_ptr, sys::ImTextureStatus_Destroyed);
+                    continue;
+                }
+
+                let width = tex.Width as u32;
+                let height = tex.Height as u32;
+                if width == 0 || height == 0 || tex.Pixels.is_null() {
+                    continue;
+                }
+
+                let pitch = sys::ImTextureData_GetPitch(tex_ptr) as usize;
+                let data = std::slice::from_raw_parts(
+                    tex.Pixels as *const u8,
+                    pitch * height as usize,
+                );
+                let bpp = tex.BytesPerPixel as usize;
+                let is_invalid = tex.TexID == 0;
+
+                if status == sys::ImTextureStatus_WantCreate || is_invalid {
+                    let texture_id = self.texture_heap.create_texture(width, height)?;
+                    self.texture_heap.upload_texture_region(
+                        texture_id,
+                        data,
+                        width,
+                        height,
+                        pitch,
+                        0,
+                        0,
+                        width,
+                        height,
+                        bpp,
+                    )?;
+                    sys::ImTextureData_SetTexID(tex_ptr, texture_id.id() as sys::ImTextureID);
+                    sys::ImTextureData_SetStatus(tex_ptr, sys::ImTextureStatus_OK);
+                    continue;
+                }
+
+                if status == sys::ImTextureStatus_WantUpdates {
+                    let texture_id = TextureId::from(tex.TexID as usize);
+                    if tex.Updates.Size > 0 && !tex.Updates.Data.is_null() {
+                        let rects = std::slice::from_raw_parts(
+                            tex.Updates.Data,
+                            tex.Updates.Size as usize,
+                        );
+                        for rect in rects {
+                            let x = rect.x as u32;
+                            let y = rect.y as u32;
+                            let w = rect.w as u32;
+                            let h = rect.h as u32;
+                            if w == 0 || h == 0 {
+                                continue;
+                            }
+                            self.texture_heap.upload_texture_region(
+                                texture_id,
+                                data,
+                                width,
+                                height,
+                                pitch,
+                                x,
+                                y,
+                                w,
+                                h,
+                                bpp,
+                            )?;
+                        }
+                    } else if tex.UpdateRect.w != 0 && tex.UpdateRect.h != 0 {
+                        let x = tex.UpdateRect.x as u32;
+                        let y = tex.UpdateRect.y as u32;
+                        let w = tex.UpdateRect.w as u32;
+                        let h = tex.UpdateRect.h as u32;
+                        self.texture_heap.upload_texture_region(
+                            texture_id,
+                            data,
+                            width,
+                            height,
+                            pitch,
+                            x,
+                            y,
+                            w,
+                            h,
+                            bpp,
+                        )?;
+                    } else {
+                        self.texture_heap.upload_texture_region(
+                            texture_id,
+                            data,
+                            width,
+                            height,
+                            pitch,
+                            0,
+                            0,
+                            width,
+                            height,
+                            bpp,
+                        )?;
+                    }
+
+                    sys::ImTextureData_SetStatus(tex_ptr, sys::ImTextureStatus_OK);
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl D3D12RenderEngine {
@@ -851,6 +984,34 @@ impl TextureHeap {
         width: u32,
         height: u32,
     ) -> Result<()> {
+        let src_pitch = (width as usize) * 4;
+        self.upload_texture_region(
+            texture_id,
+            data,
+            width,
+            height,
+            src_pitch,
+            0,
+            0,
+            width,
+            height,
+            4,
+        )
+    }
+
+    unsafe fn upload_texture_region(
+        &mut self,
+        texture_id: TextureId,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        src_pitch: usize,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        bpp: usize,
+    ) -> Result<()> {
         let texture = &self.textures[texture_id.id()];
         if texture.width != width || texture.height != height {
             error!(
@@ -860,10 +1021,10 @@ impl TextureHeap {
             return Err(Error::from_hresult(HRESULT(-1)));
         }
 
-        let upload_row_size = width * 4;
+        let upload_row_size = w * 4;
         let align = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
         let upload_pitch = upload_row_size.div_ceil(align) * align; // 256 bytes aligned
-        let upload_size = height * upload_pitch;
+        let upload_size = h * upload_pitch;
 
         let upload_buffer: ID3D12Resource = util::try_out_ptr(|v| unsafe {
             self.device.CreateCommittedResource(
@@ -895,12 +1056,23 @@ impl TextureHeap {
 
         let mut upload_buffer_ptr = ptr::null_mut();
         upload_buffer.Map(0, None, Some(&mut upload_buffer_ptr))?;
-        if upload_row_size == upload_pitch {
-            ptr::copy_nonoverlapping(data.as_ptr(), upload_buffer_ptr as *mut u8, data.len());
-        } else {
-            for y in 0..height {
-                let src = data.as_ptr().add((y * upload_row_size) as usize);
-                let dst = (upload_buffer_ptr as *mut u8).add((y * upload_pitch) as usize);
+        let upload_ptr = upload_buffer_ptr as *mut u8;
+        for row in 0..h {
+            let src_row = (y as usize + row as usize) * src_pitch;
+            let dst_row = (row as usize) * upload_pitch as usize;
+            let dst = upload_ptr.add(dst_row);
+            if bpp == 1 {
+                for col in 0..w {
+                    let src_offset = src_row + ((x as usize + col as usize) * bpp);
+                    let a = data[src_offset];
+                    let dst_offset = (col as usize) * 4;
+                    *dst.add(dst_offset) = 255;
+                    *dst.add(dst_offset + 1) = 255;
+                    *dst.add(dst_offset + 2) = 255;
+                    *dst.add(dst_offset + 3) = a;
+                }
+            } else {
+                let src = data.as_ptr().add(src_row + (x as usize * bpp));
                 ptr::copy_nonoverlapping(src, dst, upload_row_size as usize);
             }
         }
@@ -923,8 +1095,8 @@ impl TextureHeap {
                     Offset: 0,
                     Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
                         Format: DXGI_FORMAT_R8G8B8A8_UNORM,
-                        Width: width,
-                        Height: height,
+                        Width: w,
+                        Height: h,
                         Depth: 1,
                         RowPitch: upload_pitch,
                     },
@@ -932,7 +1104,7 @@ impl TextureHeap {
             },
         };
 
-        self.command_list.CopyTextureRegion(&dst_location, 0, 0, 0, &src_location, None);
+        self.command_list.CopyTextureRegion(&dst_location, x, y, 0, &src_location, None);
         let barriers = [util::create_barrier(
             &texture.resource,
             D3D12_RESOURCE_STATE_COPY_DEST,

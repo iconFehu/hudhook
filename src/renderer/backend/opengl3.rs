@@ -5,7 +5,7 @@ use std::mem::{self, offset_of};
 
 use gl::types::*;
 use imgui::internal::RawWrapper;
-use imgui::{Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
+use imgui::{sys, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
 use once_cell::sync::OnceCell;
 use tracing::error;
 use windows::core::{s, Error, Result, HRESULT, PCSTR};
@@ -131,8 +131,12 @@ impl RenderEngine for OpenGl3RenderEngine {
     fn setup_fonts(&mut self, ctx: &mut Context) -> Result<()> {
         let fonts = ctx.fonts();
         let fonts_texture = fonts.build_rgba32_texture();
-        fonts.tex_id =
+        let texture_id =
             self.load_texture(fonts_texture.data, fonts_texture.width, fonts_texture.height)?;
+        fonts.tex_ref = sys::ImTextureRef {
+            _TexData: std::ptr::null_mut(),
+            _TexID: texture_id.id() as sys::ImTextureID,
+        };
         Ok(())
     }
 }

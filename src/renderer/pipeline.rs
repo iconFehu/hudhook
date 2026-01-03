@@ -146,6 +146,7 @@ impl<T: RenderEngine> Pipeline<T> {
         self.render_loop.render(ui);
         let draw_data = self.ctx.render();
 
+        self.engine.update_textures(draw_data)?;
         self.engine.render(draw_data, render_target)?;
 
         Ok(())

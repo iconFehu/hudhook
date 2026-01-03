@@ -2,7 +2,7 @@
 
 use std::{mem, ptr};
 
-use imgui::internal::RawWrapper;
+use imgui::internal::{RawCast, RawWrapper};
 use imgui::{sys, BackendFlags, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
 use tracing::error;
 use windows::core::{Error, Result, HRESULT};
@@ -110,8 +110,16 @@ impl RenderEngine for D3D9RenderEngine {
         let fonts_texture = fonts.build_rgba32_texture();
         let texture_id =
             self.load_texture(fonts_texture.data, fonts_texture.width, fonts_texture.height)?;
+        let fonts_raw = unsafe { fonts.raw_mut() };
+        let tex_data = unsafe { (*fonts_raw).TexData };
+        if !tex_data.is_null() {
+            unsafe {
+                sys::ImTextureData_SetTexID(tex_data, texture_id.id() as sys::ImTextureID);
+                sys::ImTextureData_SetStatus(tex_data, sys::ImTextureStatus_OK);
+            }
+        }
         fonts.tex_ref = sys::ImTextureRef {
-            _TexData: ptr::null_mut(),
+            _TexData: tex_data,
             _TexID: texture_id.id() as sys::ImTextureID,
         };
         Ok(())

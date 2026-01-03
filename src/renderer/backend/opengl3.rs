@@ -4,7 +4,7 @@ use std::ffi::{c_void, CString};
 use std::mem::{self, offset_of};
 
 use gl::types::*;
-use imgui::internal::RawWrapper;
+use imgui::internal::{RawCast, RawWrapper};
 use imgui::{sys, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
 use once_cell::sync::OnceCell;
 use tracing::error;
@@ -133,8 +133,16 @@ impl RenderEngine for OpenGl3RenderEngine {
         let fonts_texture = fonts.build_rgba32_texture();
         let texture_id =
             self.load_texture(fonts_texture.data, fonts_texture.width, fonts_texture.height)?;
+        let fonts_raw = unsafe { fonts.raw_mut() };
+        let tex_data = unsafe { (*fonts_raw).TexData };
+        if !tex_data.is_null() {
+            unsafe {
+                sys::ImTextureData_SetTexID(tex_data, texture_id.id() as sys::ImTextureID);
+                sys::ImTextureData_SetStatus(tex_data, sys::ImTextureStatus_OK);
+            }
+        }
         fonts.tex_ref = sys::ImTextureRef {
-            _TexData: std::ptr::null_mut(),
+            _TexData: tex_data,
             _TexID: texture_id.id() as sys::ImTextureID,
         };
         Ok(())

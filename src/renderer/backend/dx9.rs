@@ -5,7 +5,7 @@ use std::{mem, ptr};
 use imgui::internal::{RawCast, RawWrapper};
 use imgui::{sys, BackendFlags, Context, DrawCmd, DrawData, DrawIdx, TextureId};
 use tracing::error;
-use windows::core::Result;
+use windows::core::{Error, Result, HRESULT};
 use windows::Foundation::Numerics::Matrix4x4;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D9::*;

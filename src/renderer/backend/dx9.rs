@@ -3,9 +3,9 @@
 use std::{mem, ptr};
 
 use imgui::internal::{RawCast, RawWrapper};
-use imgui::{sys, BackendFlags, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
+use imgui::{sys, BackendFlags, Context, DrawCmd, DrawData, DrawIdx, TextureId};
 use tracing::error;
-use windows::core::{Error, Result, HRESULT};
+use windows::core::Result;
 use windows::Foundation::Numerics::Matrix4x4;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D9::*;
@@ -448,7 +448,7 @@ impl BufferType for IDirect3DVertexBuffer9 {
     ) -> Result<IDirect3DVertexBuffer9> {
         util::try_out_ptr(|v| unsafe {
             device.CreateVertexBuffer(
-                (resource_capacity * mem::size_of::<DrawVert>()) as u32,
+                (resource_capacity * mem::size_of::<CustomVertex>()) as u32,
                 (D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY) as u32,
                 D3DFVF_CUSTOMVERTEX,
                 D3DPOOL_DEFAULT,

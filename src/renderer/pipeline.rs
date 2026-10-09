@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::mem;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -43,8 +43,18 @@ pub(crate) struct PipelineMessage(
 
 pub(crate) struct PipelineSharedState {
     pub(crate) message_filter: AtomicU32,
-    pub(crate) wnd_proc: WndProcType,
+    wnd_proc: AtomicUsize,
+    accept_messages: AtomicBool,
+    detached: AtomicBool,
     pub(crate) tx: Sender<PipelineMessage>,
+}
+
+impl PipelineSharedState {
+    fn original_window_procedure(&self) -> WndProcType {
+        // Only non-null window procedures, never pipeline_wnd_proc itself,
+        // are stored by install_window_procedure.
+        unsafe { mem::transmute(self.wnd_proc.load(Ordering::Acquire)) }
+    }
 }
 
 pub(crate) struct Pipeline<T: RenderEngine> {
@@ -76,27 +86,11 @@ impl<T: RenderEngine> Pipeline<T> {
             return Err((e, render_loop));
         }
 
-        let wnd_proc = unsafe {
-            #[cfg(target_arch = "x86")]
-            type SwlpRet = i32;
-            #[cfg(target_arch = "x86_64")]
-            type SwlpRet = isize;
-
-            mem::transmute::<SwlpRet, WndProcType>(SetWindowLongPtrW(
-                hwnd,
-                GWLP_WNDPROC,
-                pipeline_wnd_proc as *const () as _,
-            ))
-        };
-
         let (tx, rx) = mpsc::channel();
-        let shared_state = Arc::new(PipelineSharedState {
-            message_filter: AtomicU32::new(MessageFilter::empty().bits()),
-            wnd_proc,
-            tx,
-        });
-
-        PIPELINE_STATES.lock().insert(hwnd.0 as usize, Arc::clone(&shared_state));
+        let shared_state = match install_window_procedure(hwnd, tx) {
+            Ok(shared_state) => shared_state,
+            Err(error) => return Err((error, render_loop)),
+        };
 
         Ok(Self {
             hwnd,
@@ -189,7 +183,10 @@ impl<T: RenderEngine> Pipeline<T> {
         if !self.window_proc_attached {
             return Ok(());
         }
-        restore_window_procedure(self.hwnd, self.shared_state.wnd_proc)?;
+        self.shared_state.accept_messages.store(false, Ordering::Release);
+        self.shared_state.message_filter.store(MessageFilter::empty().bits(), Ordering::SeqCst);
+        restore_window_procedure(self.hwnd, self.shared_state.original_window_procedure())?;
+        self.shared_state.detached.store(true, Ordering::Release);
         self.window_proc_attached = false;
         Ok(())
     }
@@ -216,6 +213,58 @@ impl<T: RenderEngine> Pipeline<T> {
         // the original procedure after renderer resources have been released.
         Ok(self.render_loop)
     }
+}
+
+fn install_window_procedure(
+    hwnd: HWND,
+    tx: Sender<PipelineMessage>,
+) -> Result<Arc<PipelineSharedState>> {
+    let original = unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) } as usize;
+    if original == 0 || original == pipeline_wnd_proc as *const () as usize {
+        return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+    }
+    let shared_state = Arc::new(PipelineSharedState {
+        message_filter: AtomicU32::new(MessageFilter::empty().bits()),
+        wnd_proc: AtomicUsize::new(original),
+        accept_messages: AtomicBool::new(false),
+        detached: AtomicBool::new(true),
+        tx,
+    });
+    {
+        let mut states = PIPELINE_STATES.lock();
+        if states
+            .get(&(hwnd.0 as usize))
+            .is_some_and(|state| !state.detached.load(Ordering::Acquire))
+        {
+            // A previous failed detach can leave another subclass forwarding
+            // through us. Replacing its original would create a cycle.
+            return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+        }
+        // Publish forwarding state before installing the procedure. A late
+        // callback from an older resident pipeline also sees a valid chain.
+        states.insert(hwnd.0 as usize, Arc::clone(&shared_state));
+    }
+    unsafe {
+        SetLastError(WIN32_ERROR(0));
+        let previous = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, pipeline_wnd_proc as *const () as _);
+        if previous == 0 && GetLastError().0 != 0 {
+            return Err(Error::from_thread());
+        }
+        shared_state.detached.store(false, Ordering::Release);
+        if previous as usize != original {
+            // Preserve a subclass installed between the read and replace.
+            // Do not enable rendering with an unverified forwarding chain.
+            if previous != 0 && previous as usize != pipeline_wnd_proc as *const () as usize {
+                shared_state.wnd_proc.store(previous as usize, Ordering::Release);
+            }
+            if restore_window_procedure(hwnd, shared_state.original_window_procedure()).is_ok() {
+                shared_state.detached.store(true, Ordering::Release);
+            }
+            return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+        }
+    }
+    shared_state.accept_messages.store(true, Ordering::Release);
+    Ok(shared_state)
 }
 
 fn restore_window_procedure(hwnd: HWND, original: WndProcType) -> Result<()> {
@@ -268,8 +317,13 @@ unsafe extern "system" fn pipeline_wnd_proc(
         Arc::clone(shared_state)
     };
 
-    if let Err(e) = shared_state.tx.send(PipelineMessage(SendableHwnd(hwnd), msg, wparam, lparam)) {
-        error!("Could not send window message through pipeline: {e:?}");
+    let accepting = shared_state.accept_messages.load(Ordering::Acquire);
+    if accepting {
+        if let Err(e) =
+            shared_state.tx.send(PipelineMessage(SendableHwnd(hwnd), msg, wparam, lparam))
+        {
+            error!("Could not send window message through pipeline: {e:?}");
+        }
     }
 
     // CONCURRENCY: as the message interpretation now happens out of band, this
@@ -277,20 +331,169 @@ unsafe extern "system" fn pipeline_wnd_proc(
     let message_filter =
         MessageFilter::from_bits_retain(shared_state.message_filter.load(Ordering::SeqCst));
 
-    if message_filter.is_blocking(msg) {
+    if accepting && message_filter.is_blocking(msg) {
         LRESULT(1)
     } else {
-        CallWindowProcW(Some(shared_state.wnd_proc), hwnd, msg, wparam, lparam)
+        CallWindowProcW(Some(shared_state.original_window_procedure()), hwnd, msg, wparam, lparam)
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
+    use imgui::{DrawData, TextureId, Ui};
+
     use super::*;
     use crate::hooks::DummyHwnd;
+    use crate::{RenderContext, LIFECYCLE_TEST_LOCK};
+
+    struct TestEngine(Arc<AtomicUsize>);
+
+    impl Drop for TestEngine {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    impl RenderContext for TestEngine {
+        fn load_texture(&mut self, _: &[u8], _: u32, _: u32) -> Result<TextureId> {
+            Ok(TextureId::from(1usize))
+        }
+
+        fn replace_texture(&mut self, _: TextureId, _: &[u8], _: u32, _: u32) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    impl RenderEngine for TestEngine {
+        type RenderTarget = ();
+
+        fn render(&mut self, _: &DrawData, _: ()) -> Result<()> {
+            Ok(())
+        }
+
+        fn setup_fonts(&mut self, _: &mut Context) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    struct TestLoop {
+        initialized: Arc<AtomicUsize>,
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl ImguiRenderLoop for TestLoop {
+        fn initialize<'a>(&'a mut self, _: &mut Context, _: &'a mut dyn RenderContext) {
+            self.initialized.fetch_add(1, Ordering::Relaxed);
+        }
+
+        fn render(&mut self, _: &mut Ui) {}
+    }
+
+    impl Drop for TestLoop {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[test]
+    fn resident_pipeline_recreates_resources_and_keeps_window_forwarding() {
+        let _test_lock = LIFECYCLE_TEST_LOCK.lock().unwrap();
+        unsafe extern "system" fn replacement_original(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            if msg == 0x8001 {
+                return LRESULT(83);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
+        let window = DummyHwnd::new();
+        let hwnd = window.hwnd();
+        let original = unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) };
+        let initialized = Arc::new(AtomicUsize::new(0));
+        let loops_dropped = Arc::new(AtomicUsize::new(0));
+        let engines_dropped = Arc::new(AtomicUsize::new(0));
+        let mut pipeline = Pipeline::new(
+            hwnd,
+            Context::create(),
+            TestEngine(Arc::clone(&engines_dropped)),
+            Box::new(TestLoop {
+                initialized: Arc::clone(&initialized),
+                dropped: Arc::clone(&loops_dropped),
+            }),
+        )
+        .unwrap_or_else(|_| panic!("Could not create first pipeline"));
+        let first_state = Arc::clone(&pipeline.shared_state);
+        let (duplicate_tx, _) = mpsc::channel();
+        assert!(install_window_procedure(hwnd, duplicate_tx).is_err());
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, replacement_original as *const () as _) };
+        assert!(pipeline.detach_window_procedure().is_err());
+        let (unsafe_chain_tx, _) = mpsc::channel();
+        assert!(install_window_procedure(hwnd, unsafe_chain_tx).is_err());
+        assert!(
+            Arc::ptr_eq(PIPELINE_STATES.lock().get(&(hwnd.0 as usize)).unwrap(), &first_state,)
+        );
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, pipeline_wnd_proc as *const () as _) };
+        pipeline.detach_window_procedure().unwrap();
+        let render_loop =
+            pipeline.take_resident().unwrap_or_else(|_| panic!("Could not release pipeline"));
+        assert_eq!(engines_dropped.load(Ordering::Relaxed), 1);
+        assert_eq!(loops_dropped.load(Ordering::Relaxed), 0);
+        assert!(!first_state.accept_messages.load(Ordering::Acquire));
+        assert_eq!(unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) }, original);
+
+        // Model the owner's game WndProc being reinstalled before resume.
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, replacement_original as *const () as _) };
+        let hwnd_raw = hwnd.0 as usize;
+        let engines_dropped_for_resume = Arc::clone(&engines_dropped);
+        std::thread::spawn(move || {
+            let hwnd = HWND(hwnd_raw as _);
+            // The new context belongs to the callback thread, which may
+            // differ from the thread used by the preceding render cycle.
+            let mut pipeline = Pipeline::new(
+                hwnd,
+                Context::create(),
+                TestEngine(engines_dropped_for_resume),
+                render_loop,
+            )
+            .unwrap_or_else(|_| panic!("Could not create resumed pipeline"));
+            assert_eq!(
+                pipeline.shared_state.original_window_procedure() as usize,
+                replacement_original as *const () as usize
+            );
+            assert_eq!(
+                unsafe { pipeline_wnd_proc(hwnd, 0x8001, WPARAM(0), LPARAM(0)) },
+                LRESULT(83)
+            );
+            pipeline.detach_window_procedure().unwrap();
+            let render_loop = pipeline
+                .take_resident()
+                .unwrap_or_else(|_| panic!("Could not stop resumed pipeline"));
+            // A late cached callback must still forward after resources drop.
+            assert_eq!(
+                unsafe { pipeline_wnd_proc(hwnd, 0x8001, WPARAM(0), LPARAM(0)) },
+                LRESULT(83)
+            );
+            drop(render_loop);
+        })
+        .join()
+        .unwrap();
+
+        assert_eq!(initialized.load(Ordering::Relaxed), 2);
+        assert_eq!(engines_dropped.load(Ordering::Relaxed), 2);
+        assert_eq!(loops_dropped.load(Ordering::Relaxed), 1);
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, original) };
+        PIPELINE_STATES.lock().remove(&(hwnd.0 as usize));
+    }
 
     #[test]
     fn window_procedure_detach_preserves_later_subclasses() {
+        let _test_lock = LIFECYCLE_TEST_LOCK.lock().unwrap();
         unsafe extern "system" fn later_subclass(
             hwnd: HWND,
             msg: u32,

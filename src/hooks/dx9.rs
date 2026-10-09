@@ -262,7 +262,11 @@ impl Hooks for ImguiDx9Hooks {
         }
         if let Some(pipeline) = PIPELINE.take() {
             match pipeline.into_inner().take_resident() {
-                Ok(render_loop) => drop(render_loop),
+                Ok(render_loop) => {
+                    RENDER_LOOP
+                        .set(render_loop)
+                        .map_err(|_| Error::from_hresult(HRESULT(0x80004005u32 as i32)))?;
+                },
                 Err(boxed_err) => {
                     let (error, pipeline) = *boxed_err;
                     let _ = PIPELINE.set(Mutex::new(pipeline));
@@ -270,10 +274,25 @@ impl Hooks for ImguiDx9Hooks {
                 },
             }
         }
-        RENDER_LOOP.take();
         // Keep TRAMPOLINES and MinHook records: a caller may have cached a
         // detour address before we disabled the hook, but entered it later.
         Ok(())
+    }
+
+    fn validate_owned_resume(&self) -> Result<()> {
+        if !STOPPING.load(Ordering::Acquire)
+            || !OWNED_LIFECYCLE.load(Ordering::Acquire)
+            || unsafe { PIPELINE.get().is_some() || RENDER_LOOP.get().is_none() }
+        {
+            return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+        }
+        Ok(())
+    }
+
+    fn resume_owned_rendering(&mut self) {
+        // Keep context/engine creation on the actual Present thread. Only
+        // open this gate after enabling the existing MinHook records.
+        STOPPING.store(false, Ordering::Release);
     }
 
     unsafe fn unhook(&mut self) {

@@ -151,6 +151,8 @@ static mut HUDHOOK: OnceCell<Hudhook> = OnceCell::new();
 static CONSOLE_ALLOCATED: AtomicBool = AtomicBool::new(false);
 static EJECT_REQUESTED: AtomicBool = AtomicBool::new(false);
 static HOOK_EJECTION_BARRIER: HookEjectionBarrier = HookEjectionBarrier::new();
+#[cfg(test)]
+pub(crate) static LIFECYCLE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Texture Loader for ImguiRenderLoop callbacks to load and replace textures
 pub trait RenderContext {
@@ -358,6 +360,16 @@ pub trait Hooks {
         Err(Error::from_hresult(windows::core::HRESULT(0x80004001u32 as i32)))
     }
 
+    /// Validate that stopped renderer resources can be recreated using the
+    /// retained render loop and hooks. The default rejects resuming.
+    fn validate_owned_resume(&self) -> Result<(), Error> {
+        Err(Error::from_hresult(windows::core::HRESULT(0x80004001u32 as i32)))
+    }
+
+    /// Allow renderer creation after all retained hooks have been enabled.
+    /// This is called only after [`Self::validate_owned_resume`] succeeds.
+    fn resume_owned_rendering(&mut self) {}
+
     /// Cleanup global data and disable the hooks.
     ///
     /// # Safety
@@ -371,6 +383,9 @@ pub struct Hudhook {
     hooks: Vec<Box<dyn Hooks>>,
     active: bool,
     window_procedures_detached: bool,
+    owned_lifecycle: bool,
+    shutdown_started: bool,
+    renderers_released: bool,
 }
 unsafe impl Send for Hudhook {}
 unsafe impl Sync for Hudhook {}
@@ -392,7 +407,14 @@ impl Hudhook {
             _ => unreachable!(),
         }
 
-        Hudhook { hooks: Vec::new(), active: false, window_procedures_detached: false }
+        Hudhook {
+            hooks: Vec::new(),
+            active: false,
+            window_procedures_detached: false,
+            owned_lifecycle: false,
+            shutdown_started: false,
+            renderers_released: false,
+        }
     }
 
     /// Return an iterator of all the activated raw hooks.
@@ -411,10 +433,15 @@ impl Hudhook {
 
     /// Enable hooks while retaining ownership in the caller. This does not
     /// register an eject handler or transfer ownership of the containing DLL.
+    /// After shutdown, use [`Self::resume_owned`] instead of applying again.
     pub fn apply_owned(&mut self) -> Result<(), MH_STATUS> {
+        if self.shutdown_started {
+            return Err(MH_STATUS::MH_ERROR_DISABLED);
+        }
         for hook in &mut self.hooks {
             hook.use_owned_lifecycle();
         }
+        self.owned_lifecycle = true;
         self.enable()
     }
 
@@ -440,6 +467,7 @@ impl Hudhook {
     /// The caller must also detach window procedures and drain callbacks
     /// before calling [`Self::cleanup_owned`].
     pub fn disable(&mut self) -> Result<(), MH_STATUS> {
+        self.shutdown_started = true;
         for hook in &mut self.hooks {
             hook.begin_shutdown();
         }
@@ -476,11 +504,61 @@ impl Hudhook {
     /// callbacks, detaching window procedures, and draining callbacks again.
     /// The containing DLL must remain loaded after this logical shutdown.
     pub fn release_owned_renderers(&mut self) -> Result<(), Error> {
-        if self.active || !self.window_procedures_detached || !self.wait_for_idle(Duration::ZERO) {
+        if !self.owned_lifecycle
+            || !self.shutdown_started
+            || self.active
+            || !self.window_procedures_detached
+            || !self.wait_for_idle(Duration::ZERO)
+        {
             return Err(Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)));
+        }
+        if self.renderers_released {
+            return Ok(());
         }
         for hook in &mut self.hooks {
             unsafe { hook.release_render_resources()? };
+        }
+        self.renderers_released = true;
+        Ok(())
+    }
+
+    /// Resume a resident hook set after [`Self::release_owned_renderers`]
+    /// succeeds. Reuses its existing MinHook records and trampolines; do not
+    /// construct a second hook set for the same rendering backend.
+    ///
+    /// DirectX 9 retains the render loop and creates a new ImGui context and
+    /// renderer on the next render callback, calling `initialize` again.
+    /// Other hook sets must implement resume validation and rendering.
+    /// Calls during an incomplete shutdown are rejected. On enable failure,
+    /// rendering stays stopped and disabling the retained hooks is attempted.
+    pub fn resume_owned(&mut self) -> Result<(), Error> {
+        if !self.owned_lifecycle
+            || !self.shutdown_started
+            || !self.renderers_released
+            || self.active
+            || !self.window_procedures_detached
+        {
+            return Err(Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)));
+        }
+        for hook in &self.hooks {
+            hook.validate_owned_resume()?;
+        }
+        if let Err(status) = self.enable() {
+            // MinHook can fail after enabling part of its queue. Treat this
+            // conservatively as active until rollback has succeeded.
+            self.active = true;
+            if let Err(rollback_status) = self.disable() {
+                error!("Could not roll back resumed hooks: {rollback_status:?}");
+            }
+            return Err(Error::new(
+                windows::core::HRESULT(0x80004005u32 as i32),
+                format!("Could not resume hooks: {status:?}"),
+            ));
+        }
+        self.renderers_released = false;
+        self.shutdown_started = false;
+        for hook in &mut self.hooks {
+            hook.resume_owned_rendering();
         }
         Ok(())
     }
@@ -505,6 +583,7 @@ impl Hudhook {
             hook.unhook();
         }
         self.hooks.clear();
+        self.renderers_released = false;
         Ok(())
     }
 
@@ -683,11 +762,15 @@ mod owned_lifecycle_tests {
 
     #[test]
     fn resident_release_requires_detach_and_idle_callbacks() {
+        let _test_lock = LIFECYCLE_TEST_LOCK.lock().unwrap();
         let released = Arc::new(AtomicUsize::new(0));
         let mut hook = Hudhook {
             hooks: vec![Box::new(ResidentHooks(Arc::clone(&released)))],
             active: false,
             window_procedures_detached: false,
+            owned_lifecycle: true,
+            shutdown_started: true,
+            renderers_released: false,
         };
         assert!(hook.release_owned_renderers().is_err());
         hook.detach_window_procedures().unwrap();
@@ -698,5 +781,89 @@ mod owned_lifecycle_tests {
         hook.release_owned_renderers().unwrap();
         assert_eq!(released.load(Ordering::Relaxed), 1);
         assert_eq!(hook.hooks.len(), 1);
+        assert!(hook.resume_owned().is_err());
+        assert!(!hook.active);
+    }
+
+    struct ResumableHooks {
+        released: Arc<AtomicUsize>,
+        resumed: Arc<AtomicUsize>,
+        stopping: bool,
+    }
+
+    impl Hooks for ResumableHooks {
+        fn from_render_loop<T>(_: T) -> Box<Self>
+        where
+            Self: Sized,
+            T: ImguiRenderLoop + Send + Sync + 'static,
+        {
+            unreachable!()
+        }
+
+        fn hooks(&self) -> &[MhHook] {
+            &[]
+        }
+
+        fn begin_shutdown(&mut self) {
+            self.stopping = true;
+        }
+
+        fn detach_window_procedures(&mut self) -> Result<(), Error> {
+            assert!(self.stopping);
+            Ok(())
+        }
+
+        unsafe fn release_render_resources(&mut self) -> Result<(), Error> {
+            assert!(self.stopping);
+            self.released.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        fn validate_owned_resume(&self) -> Result<(), Error> {
+            assert!(self.stopping);
+            assert!(self.released.load(Ordering::Relaxed) > self.resumed.load(Ordering::Relaxed));
+            Ok(())
+        }
+
+        fn resume_owned_rendering(&mut self) {
+            assert!(self.stopping);
+            self.stopping = false;
+            self.resumed.fetch_add(1, Ordering::Relaxed);
+        }
+
+        unsafe fn unhook(&mut self) {
+            panic!("Resume must reuse the retained hook set");
+        }
+    }
+
+    #[test]
+    fn resident_resume_requires_complete_shutdown_and_can_repeat() {
+        let _test_lock = LIFECYCLE_TEST_LOCK.lock().unwrap();
+        let released = Arc::new(AtomicUsize::new(0));
+        let resumed = Arc::new(AtomicUsize::new(0));
+        let mut hook = Hudhook::new();
+        hook.hooks.push(Box::new(ResumableHooks {
+            released: Arc::clone(&released),
+            resumed: Arc::clone(&resumed),
+            stopping: false,
+        }));
+        assert!(hook.resume_owned().is_err());
+        hook.apply_owned().unwrap();
+        assert!(hook.resume_owned().is_err());
+        for cycle in 1..=3 {
+            hook.disable().unwrap();
+            assert!(hook.resume_owned().is_err());
+            hook.detach_window_procedures().unwrap();
+            assert!(hook.resume_owned().is_err());
+            hook.release_owned_renderers().unwrap();
+            hook.release_owned_renderers().unwrap();
+            assert_eq!(released.load(Ordering::Relaxed), cycle);
+            assert_eq!(hook.apply_owned(), Err(MH_STATUS::MH_ERROR_DISABLED));
+            hook.resume_owned().unwrap();
+            assert!(hook.active);
+            assert_eq!(resumed.load(Ordering::Relaxed), cycle);
+            assert_eq!(hook.hooks.len(), 1);
+            assert!(hook.resume_owned().is_err());
+        }
     }
 }

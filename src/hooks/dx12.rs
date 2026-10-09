@@ -233,6 +233,8 @@ static INIT_STATE: InitState = InitState::new();
 static mut PIPELINE: OnceCell<Mutex<Pipeline<D3D12RenderEngine>>> = OnceCell::new();
 static mut RENDER_LOOP: OnceCell<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceCell::new();
 static ACTIVE_CONTEXT: Mutex<Option<ActiveDx12Context>> = Mutex::new(None);
+static STOPPING: AtomicBool = AtomicBool::new(false);
+static OWNED_LIFECYCLE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone)]
 struct ActiveDx12Context {
@@ -634,6 +636,9 @@ unsafe fn update_display_size_after_swap_chain_change(
 }
 
 fn render(swap_chain: &IDXGISwapChain3) -> Result<()> {
+    if STOPPING.load(Ordering::Acquire) {
+        return Ok(());
+    }
     unsafe {
         if !validate_pending_initialization_context(swap_chain)? {
             return Ok(());
@@ -709,7 +714,7 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     let result = dxgi_swap_chain_present(swap_chain, sync_interval, flags);
     handle_present_result("IDXGISwapChain::Present", result);
 
-    if EJECT_REQUESTED.load(Ordering::SeqCst) {
+    if !OWNED_LIFECYCLE.load(Ordering::Acquire) && EJECT_REQUESTED.load(Ordering::SeqCst) {
         perform_eject();
     }
 
@@ -743,7 +748,7 @@ unsafe extern "system" fn dxgi_swap_chain_present1_impl(
         dxgi_swap_chain_present1(swap_chain, sync_interval, present_flags, present_parameters);
     handle_present_result("IDXGISwapChain1::Present1", result);
 
-    if EJECT_REQUESTED.load(Ordering::SeqCst) {
+    if !OWNED_LIFECYCLE.load(Ordering::Acquire) && EJECT_REQUESTED.load(Ordering::SeqCst) {
         perform_eject();
     }
 
@@ -761,6 +766,18 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     let Trampolines { dxgi_swap_chain_resize_buffers, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
+
+    if STOPPING.load(Ordering::Acquire) {
+        trace!("Call IDXGISwapChain::ResizeBuffers trampoline (stopping)");
+        return dxgi_swap_chain_resize_buffers(
+            p_this,
+            buffer_count,
+            width,
+            height,
+            new_format,
+            flags,
+        );
+    }
 
     wait_for_pipeline_idle_before("ResizeBuffers");
 
@@ -789,6 +806,11 @@ unsafe extern "system" fn dxgi_swap_chain_set_source_size_impl(
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     let Trampolines { dxgi_swap_chain_set_source_size, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
+
+    if STOPPING.load(Ordering::Acquire) {
+        trace!("Call IDXGISwapChain2::SetSourceSize trampoline (stopping)");
+        return dxgi_swap_chain_set_source_size(swap_chain.clone(), width, height);
+    }
 
     wait_for_pipeline_idle_before("SetSourceSize");
 
@@ -819,6 +841,20 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers1_impl(
     let _hook_ejection_guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     let Trampolines { dxgi_swap_chain_resize_buffers1, .. } =
         TRAMPOLINES.get().expect("DirectX 12 trampolines uninitialized");
+
+    if STOPPING.load(Ordering::Acquire) {
+        trace!("Call IDXGISwapChain3::ResizeBuffers1 trampoline (stopping)");
+        return dxgi_swap_chain_resize_buffers1(
+            p_this,
+            buffer_count,
+            width,
+            height,
+            new_format,
+            flags,
+            creation_node_mask,
+            present_queue,
+        );
+    }
 
     wait_for_pipeline_idle_before("ResizeBuffers1");
 
@@ -1071,6 +1107,8 @@ impl ImguiDx12Hooks {
     where
         T: ImguiRenderLoop + Send + Sync + 'static,
     {
+        STOPPING.store(false, Ordering::Release);
+        OWNED_LIFECYCLE.store(false, Ordering::Release);
         let (
             dxgi_factory_create_swap_chain_addr,
             dxgi_factory_create_swap_chain_for_hwnd_addr,
@@ -1194,6 +1232,45 @@ impl Hooks for ImguiDx12Hooks {
 
     fn hooks(&self) -> &[MhHook] {
         &self.0
+    }
+
+    fn use_owned_lifecycle(&mut self) {
+        OWNED_LIFECYCLE.store(true, Ordering::Release);
+    }
+
+    fn begin_shutdown(&mut self) {
+        STOPPING.store(true, Ordering::Release);
+    }
+
+    fn detach_window_procedures(&mut self) -> Result<()> {
+        if let Some(pipeline) = unsafe { PIPELINE.get() } {
+            let Some(mut pipeline) = pipeline.try_lock() else {
+                return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+            };
+            pipeline.detach_window_procedure()?;
+        }
+        Ok(())
+    }
+
+    unsafe fn release_render_resources(&mut self) -> Result<()> {
+        if !STOPPING.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+        }
+        if let Some(pipeline) = PIPELINE.take() {
+            match pipeline.into_inner().take_resident() {
+                Ok(render_loop) => drop(render_loop),
+                Err(boxed_err) => {
+                    let (error, pipeline) = *boxed_err;
+                    let _ = PIPELINE.set(Mutex::new(pipeline));
+                    return Err(error);
+                },
+            }
+        }
+        RENDER_LOOP.take();
+        // Keep TRAMPOLINES, MinHook records, INIT_STATE, and ACTIVE_CONTEXT:
+        // a caller may have cached a detour address before we disabled the
+        // hook, but entered it later.
+        Ok(())
     }
 
     unsafe fn unhook(&mut self) {

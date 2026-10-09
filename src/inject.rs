@@ -7,15 +7,18 @@ use std::path::PathBuf;
 use tracing::debug;
 #[cfg(target_arch = "x86")]
 use windows::core::PCSTR;
-use windows::core::{s, w, Error, Result, HRESULT, HSTRING, PCWSTR};
+#[cfg(target_arch = "x86_64")]
+use windows::core::PCWSTR;
+use windows::core::{s, w, Error, Result, HRESULT, HSTRING};
 use windows::Win32::Foundation::{CloseHandle, HANDLE, MAX_PATH};
 use windows::Win32::System::Diagnostics::Debug::WriteProcessMemory;
-use windows::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
-};
 #[cfg(target_arch = "x86")]
 use windows::Win32::System::Diagnostics::ToolHelp::{
-    Process32First, Process32Next, PROCESSENTRY32,
+    CreateToolhelp32Snapshot, Process32First, Process32Next, PROCESSENTRY32, TH32CS_SNAPPROCESS,
+};
+#[cfg(target_arch = "x86_64")]
+use windows::Win32::System::Diagnostics::ToolHelp::{
+    CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W, TH32CS_SNAPPROCESS,
 };
 use windows::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
 use windows::Win32::System::Memory::{
@@ -27,6 +30,9 @@ use windows::Win32::System::Threading::{
 };
 #[cfg(target_arch = "x86")]
 use windows::Win32::UI::WindowsAndMessaging::FindWindowA;
+#[cfg(target_arch = "x86")]
+use windows::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+#[cfg(target_arch = "x86_64")]
 use windows::Win32::UI::WindowsAndMessaging::{FindWindowW, GetWindowThreadProcessId};
 
 /// A process, open with the permissions appropriate for injection.

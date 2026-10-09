@@ -9,15 +9,17 @@ use imgui::Context;
 use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use tracing::{error, warn};
-use windows::core::{Error, Result};
-use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
+use windows::core::{Error, Result, HRESULT};
+use windows::Win32::Foundation::{
+    GetLastError, SetLastError, HWND, LPARAM, LRESULT, WIN32_ERROR, WPARAM,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
-    CallWindowProcW, DefWindowProcW, SetWindowLongPtrW, GWLP_WNDPROC,
+    CallWindowProcW, DefWindowProcW, GetWindowLongPtrW, IsWindow, SetWindowLongPtrW, GWLP_WNDPROC,
 };
 
 use crate::renderer::input::{imgui_wnd_proc_impl, WndProcType};
 use crate::renderer::RenderEngine;
-use crate::{util, ImguiRenderLoop, MessageFilter};
+use crate::{util, ImguiRenderLoop, MessageFilter, HOOK_EJECTION_BARRIER};
 
 type RenderLoop = Box<dyn ImguiRenderLoop + Send + Sync>;
 
@@ -54,6 +56,7 @@ pub(crate) struct Pipeline<T: RenderEngine> {
     shared_state: Arc<PipelineSharedState>,
     queue_buffer: Vec<PipelineMessage>,
     last_frame: Option<Instant>,
+    window_proc_attached: bool,
 }
 
 impl<T: RenderEngine> Pipeline<T> {
@@ -104,6 +107,7 @@ impl<T: RenderEngine> Pipeline<T> {
             shared_state: Arc::clone(&shared_state),
             queue_buffer: Vec::new(),
             last_frame: None,
+            window_proc_attached: true,
         })
     }
 
@@ -181,16 +185,65 @@ impl<T: RenderEngine> Pipeline<T> {
         self.engine.wait_idle()
     }
 
+    pub(crate) fn detach_window_procedure(&mut self) -> Result<()> {
+        if !self.window_proc_attached {
+            return Ok(());
+        }
+        restore_window_procedure(self.hwnd, self.shared_state.wnd_proc)?;
+        self.window_proc_attached = false;
+        Ok(())
+    }
+
     pub(crate) fn cleanup(&mut self) {
-        unsafe {
-            SetWindowLongPtrW(self.hwnd, GWLP_WNDPROC, self.shared_state.wnd_proc as usize as _)
-        };
+        if let Err(e) = self.detach_window_procedure() {
+            error!("Could not detach renderer window procedure: {e:?}");
+            return;
+        }
         PIPELINE_STATES.lock().remove(&(self.hwnd.0 as usize));
     }
 
     pub(crate) fn take(mut self) -> RenderLoop {
         self.cleanup();
         self.render_loop
+    }
+
+    pub(crate) fn take_resident(mut self) -> std::result::Result<RenderLoop, Box<(Error, Self)>> {
+        if let Err(error) = self.detach_window_procedure() {
+            return Err(Box::new((error, self)));
+        }
+        self.shared_state.message_filter.store(MessageFilter::empty().bits(), Ordering::SeqCst);
+        // Preserve PIPELINE_STATES so a late window callback can still find
+        // the original procedure after renderer resources have been released.
+        Ok(self.render_loop)
+    }
+}
+
+fn restore_window_procedure(hwnd: HWND, original: WndProcType) -> Result<()> {
+    unsafe {
+        if !IsWindow(Some(hwnd)).as_bool() {
+            return Ok(());
+        }
+        let current = GetWindowLongPtrW(hwnd, GWLP_WNDPROC) as usize;
+        if current == original as usize {
+            return Ok(());
+        }
+        if current != pipeline_wnd_proc as *const () as usize {
+            // A later subclass may still call through us. Overwriting it
+            // would break its chain and would not make DLL unloading safe.
+            return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+        }
+        SetLastError(WIN32_ERROR(0));
+        let previous = SetWindowLongPtrW(hwnd, GWLP_WNDPROC, original as usize as _);
+        if previous == 0 && GetLastError().0 != 0 {
+            return Err(Error::from_thread());
+        }
+        if previous as usize != pipeline_wnd_proc as *const () as usize {
+            // Another subclass arrived between the read and restore.
+            // Put its procedure back and retain our forwarding state.
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, previous);
+            return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+        }
+        Ok(())
     }
 }
 
@@ -200,6 +253,7 @@ unsafe extern "system" fn pipeline_wnd_proc(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
+    let _guard = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
     let shared_state = {
         let Some(shared_state_guard) = PIPELINE_STATES.try_lock() else {
             error!("Could not lock shared state in window procedure");
@@ -227,5 +281,47 @@ unsafe extern "system" fn pipeline_wnd_proc(
         LRESULT(1)
     } else {
         CallWindowProcW(Some(shared_state.wnd_proc), hwnd, msg, wparam, lparam)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hooks::DummyHwnd;
+
+    #[test]
+    fn window_procedure_detach_preserves_later_subclasses() {
+        unsafe extern "system" fn later_subclass(
+            hwnd: HWND,
+            msg: u32,
+            wparam: WPARAM,
+            lparam: LPARAM,
+        ) -> LRESULT {
+            if msg == 0x8001 {
+                return LRESULT(37);
+            }
+            DefWindowProcW(hwnd, msg, wparam, lparam)
+        }
+
+        let window = DummyHwnd::new();
+        let hwnd = window.hwnd();
+        assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
+        let original: WndProcType =
+            unsafe { mem::transmute(GetWindowLongPtrW(hwnd, GWLP_WNDPROC)) };
+
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, pipeline_wnd_proc as *const () as usize as _)
+        };
+        assert!(restore_window_procedure(hwnd, original).is_ok());
+        assert_eq!(unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) } as usize, original as usize);
+        assert!(restore_window_procedure(hwnd, original).is_ok());
+
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, later_subclass as *const () as usize as _) };
+        assert!(restore_window_procedure(hwnd, original).is_err());
+        assert_eq!(
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) } as usize,
+            later_subclass as *const () as usize,
+        );
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, original as usize as _) };
     }
 }

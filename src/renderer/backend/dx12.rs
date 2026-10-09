@@ -4,7 +4,7 @@ use std::ffi::c_void;
 use std::mem::{offset_of, ManuallyDrop};
 use std::{mem, ptr, slice};
 
-use imgui::internal::{RawCast, RawWrapper};
+use imgui::internal::RawWrapper;
 use imgui::{sys, BackendFlags, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
 use tracing::error;
 use windows::core::{s, w, Error, Interface, Result, HRESULT};
@@ -18,61 +18,143 @@ use crate::renderer::RenderEngine;
 use crate::util::{self, Fence};
 use crate::RenderContext;
 
+struct FrameContext {
+    command_allocator: ID3D12CommandAllocator,
+    fence_value: u64,
+    vertex_buffer: Buffer<DrawVert>,
+    index_buffer: Buffer<u16>,
+}
+
+const NUM_FRAMES: usize = 3;
+const COMMAND_ALLOCATOR_NAMES: [&str; NUM_FRAMES] =
+    ["hudhook Frame Allocator 0", "hudhook Frame Allocator 1", "hudhook Frame Allocator 2"];
+
+impl FrameContext {
+    fn new(device: &ID3D12Device, name: &str, node_mask: u32) -> Result<Self> {
+        let command_allocator: ID3D12CommandAllocator =
+            unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }?;
+        unsafe {
+            command_allocator.SetName(&windows::core::HSTRING::from(name))?;
+        }
+        Ok(FrameContext {
+            command_allocator,
+            fence_value: 0,
+            vertex_buffer: Buffer::new(device, 5000, node_mask)?,
+            index_buffer: Buffer::new(device, 10000, node_mask)?,
+        })
+    }
+}
+
 pub struct D3D12RenderEngine {
     device: ID3D12Device,
 
     command_queue: ID3D12CommandQueue,
-    command_allocator: ID3D12CommandAllocator,
     command_list: ID3D12GraphicsCommandList,
 
     #[allow(unused)]
     rtv_heap: ID3D12DescriptorHeap,
     rtv_heap_start: D3D12_CPU_DESCRIPTOR_HANDLE,
+    rtv_format: DXGI_FORMAT,
     texture_heap: TextureHeap,
 
     root_signature: ID3D12RootSignature,
     pipeline_state: ID3D12PipelineState,
 
-    vertex_buffer: Buffer<DrawVert>,
-    index_buffer: Buffer<u16>,
     projection_buffer: [[f32; 4]; 4],
+    node_mask: u32,
 
     fence: Fence,
+    frame_contexts: Vec<FrameContext>,
+    frame_index: usize,
 }
 
 impl D3D12RenderEngine {
-    pub fn new(command_queue: &ID3D12CommandQueue, ctx: &mut Context) -> Result<Self> {
-        let (device, command_queue, command_allocator, command_list) =
-            unsafe { create_command_objects(command_queue) }?;
+    pub fn rtv_format_for_swap_chain(format: DXGI_FORMAT) -> Option<DXGI_FORMAT> {
+        match format {
+            DXGI_FORMAT_UNKNOWN
+            | DXGI_FORMAT_R32G32B32A32_TYPELESS
+            | DXGI_FORMAT_R32G32B32_TYPELESS
+            | DXGI_FORMAT_R16G16B16A16_TYPELESS
+            | DXGI_FORMAT_R32G32_TYPELESS
+            | DXGI_FORMAT_R32G8X24_TYPELESS
+            | DXGI_FORMAT_R10G10B10A2_TYPELESS
+            | DXGI_FORMAT_R8G8B8A8_TYPELESS
+            | DXGI_FORMAT_R16G16_TYPELESS
+            | DXGI_FORMAT_R32_TYPELESS
+            | DXGI_FORMAT_R24G8_TYPELESS
+            | DXGI_FORMAT_R8G8_TYPELESS
+            | DXGI_FORMAT_R16_TYPELESS
+            | DXGI_FORMAT_R8_TYPELESS
+            | DXGI_FORMAT_BC1_TYPELESS
+            | DXGI_FORMAT_BC2_TYPELESS
+            | DXGI_FORMAT_BC3_TYPELESS
+            | DXGI_FORMAT_BC4_TYPELESS
+            | DXGI_FORMAT_BC5_TYPELESS
+            | DXGI_FORMAT_B8G8R8A8_TYPELESS
+            | DXGI_FORMAT_B8G8R8X8_TYPELESS
+            | DXGI_FORMAT_BC6H_TYPELESS
+            | DXGI_FORMAT_BC7_TYPELESS => None,
+            DXGI_FORMAT_R8G8B8A8_UNORM_SRGB => Some(DXGI_FORMAT_R8G8B8A8_UNORM),
+            DXGI_FORMAT_B8G8R8A8_UNORM_SRGB => Some(DXGI_FORMAT_B8G8R8A8_UNORM),
+            _ => Some(format),
+        }
+    }
 
-        let (rtv_heap, texture_heap) = unsafe { create_heaps(&device) }?;
+    pub fn new(
+        command_queue: &ID3D12CommandQueue,
+        ctx: &mut Context,
+        rtv_format: DXGI_FORMAT,
+    ) -> Result<Self> {
+        let device: ID3D12Device = util::try_out_ptr(|v| unsafe { command_queue.GetDevice(v) })?;
+        let node_mask = unsafe { command_queue.GetDesc() }.NodeMask;
+        let command_queue = command_queue.clone();
+
+        let mut frame_contexts = Vec::with_capacity(NUM_FRAMES);
+        for name in &COMMAND_ALLOCATOR_NAMES {
+            frame_contexts.push(FrameContext::new(&device, name, node_mask)?);
+        }
+
+        let command_list: ID3D12GraphicsCommandList = unsafe {
+            device.CreateCommandList(
+                node_mask,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &frame_contexts[0].command_allocator,
+                None,
+            )
+        }?;
+        unsafe {
+            command_list.Close()?;
+            command_list.SetName(w!("hudhook Render Engine Command List"))?;
+        }
+
+        let (rtv_heap, texture_heap) = unsafe { create_heaps(&device, node_mask) }?;
         let rtv_heap_start = unsafe { rtv_heap.GetCPUDescriptorHandleForHeapStart() };
 
-        let (root_signature, pipeline_state) = unsafe { create_shader_program(&device) }?;
-
-        let vertex_buffer = Buffer::new(&device, 5000)?;
-        let index_buffer = Buffer::new(&device, 10000)?;
+        let (root_signature, pipeline_state) =
+            unsafe { create_shader_program(&device, rtv_format, node_mask) }?;
 
         let fence = Fence::new(&device)?;
 
         ctx.set_ini_filename(None);
-        ctx.io_mut().backend_flags |= BackendFlags::RENDERER_HAS_VTX_OFFSET;
+        ctx.io_mut().backend_flags |=
+            BackendFlags::RENDERER_HAS_VTX_OFFSET | BackendFlags::RENDERER_HAS_TEXTURES;
         ctx.set_renderer_name(String::from(concat!("hudhook-dx12@", env!("CARGO_PKG_VERSION"))));
 
         Ok(Self {
             device,
             command_queue,
-            command_allocator,
             command_list,
             rtv_heap,
             rtv_heap_start,
+            rtv_format,
             texture_heap,
             root_signature,
             pipeline_state,
-            vertex_buffer,
-            index_buffer,
             projection_buffer: Default::default(),
+            node_mask,
             fence,
+            frame_contexts,
+            frame_index: 0,
         })
     }
 }
@@ -102,10 +184,24 @@ impl RenderEngine for D3D12RenderEngine {
 
     fn render(&mut self, draw_data: &DrawData, render_target: Self::RenderTarget) -> Result<()> {
         unsafe {
-            self.device.CreateRenderTargetView(&render_target, None, self.rtv_heap_start);
+            let fc = &self.frame_contexts[self.frame_index];
 
-            self.command_allocator.Reset()?;
-            self.command_list.Reset(&self.command_allocator, None)?;
+            if fc.fence_value != 0 {
+                self.fence.wait_for_value(fc.fence_value)?;
+            }
+
+            fc.command_allocator.Reset()?;
+            self.command_list.Reset(&fc.command_allocator, None)?;
+
+            self.device.CreateRenderTargetView(
+                &render_target,
+                Some(&D3D12_RENDER_TARGET_VIEW_DESC {
+                    Format: self.rtv_format,
+                    ViewDimension: D3D12_RTV_DIMENSION_TEXTURE2D,
+                    ..Default::default()
+                }),
+                self.rtv_heap_start,
+            );
 
             let present_to_rtv_barriers = [util::create_barrier(
                 &render_target,
@@ -128,9 +224,12 @@ impl RenderEngine for D3D12RenderEngine {
             self.command_list.ResourceBarrier(&rtv_to_present_barriers);
             self.command_list.Close()?;
             self.command_queue.ExecuteCommandLists(&[Some(self.command_list.cast()?)]);
-            self.command_queue.Signal(self.fence.fence(), self.fence.value())?;
-            self.fence.wait()?;
-            self.fence.incr();
+
+            let new_fence_value = self.fence.incr() + 1;
+            self.command_queue.Signal(self.fence.fence(), new_fence_value)?;
+            self.frame_contexts[self.frame_index].fence_value = new_fence_value;
+
+            self.frame_index = (self.frame_index + 1) % self.frame_contexts.len();
 
             present_to_rtv_barriers.into_iter().for_each(util::drop_barrier);
             rtv_to_present_barriers.into_iter().for_each(util::drop_barrier);
@@ -140,28 +239,29 @@ impl RenderEngine for D3D12RenderEngine {
     }
 
     fn setup_fonts(&mut self, ctx: &mut Context) -> Result<()> {
+        // With Dear ImGui 1.92+ dynamic textures
+        // (BackendFlags::RENDERER_HAS_TEXTURES), the font atlas is
+        // built on-demand through ImTextureData system. We only need to
+        // set up the TexData pointer and initial status.
         let fonts = ctx.fonts();
-        let fonts_texture = fonts.build_rgba32_texture();
-        let texture_id =
-            self.load_texture(fonts_texture.data, fonts_texture.width, fonts_texture.height)?;
-        let fonts_raw = unsafe { fonts.raw_mut() };
+        let fonts_raw = fonts as *const _ as *mut sys::ImFontAtlas;
         let tex_data = unsafe { (*fonts_raw).TexData };
+
+        // ImGui will request texture creation via ImTextureStatus_WantCreate
+        // in update_textures() when the atlas is actually needed
         if !tex_data.is_null() {
             unsafe {
-                sys::ImTextureData_SetTexID(tex_data, texture_id.id() as sys::ImTextureID);
-                sys::ImTextureData_SetStatus(tex_data, sys::ImTextureStatus_OK);
+                // Mark as needing creation - update_textures will handle it
+                sys::ImTextureData_SetStatus(tex_data, sys::ImTextureStatus_WantCreate);
             }
         }
-        fonts.tex_ref = sys::ImTextureRef {
-            _TexData: tex_data,
-            _TexID: texture_id.id() as sys::ImTextureID,
-        };
+
         Ok(())
     }
 
     fn update_textures(&mut self, draw_data: &DrawData) -> Result<()> {
-        let raw_draw_data = unsafe { draw_data.raw() };
-        let textures_ptr = raw_draw_data.Textures;
+        let raw_draw_data = draw_data as *const _ as *const sys::ImDrawData;
+        let textures_ptr = unsafe { (*raw_draw_data).Textures };
         if textures_ptr.is_null() {
             return Ok(());
         }
@@ -198,26 +298,15 @@ impl RenderEngine for D3D12RenderEngine {
                 }
 
                 let pitch = sys::ImTextureData_GetPitch(tex_ptr) as usize;
-                let data = std::slice::from_raw_parts(
-                    tex.Pixels as *const u8,
-                    pitch * height as usize,
-                );
+                let data =
+                    std::slice::from_raw_parts(tex.Pixels as *const u8, pitch * height as usize);
                 let bpp = tex.BytesPerPixel as usize;
                 let is_invalid = tex.TexID == 0;
 
                 if status == sys::ImTextureStatus_WantCreate || is_invalid {
                     let texture_id = self.texture_heap.create_texture(width, height)?;
                     self.texture_heap.upload_texture_region(
-                        texture_id,
-                        data,
-                        width,
-                        height,
-                        pitch,
-                        0,
-                        0,
-                        width,
-                        height,
-                        bpp,
+                        texture_id, data, width, height, pitch, 0, 0, width, height, bpp,
                     )?;
                     sys::ImTextureData_SetTexID(tex_ptr, texture_id.id() as sys::ImTextureID);
                     sys::ImTextureData_SetStatus(tex_ptr, sys::ImTextureStatus_OK);
@@ -227,10 +316,8 @@ impl RenderEngine for D3D12RenderEngine {
                 if status == sys::ImTextureStatus_WantUpdates {
                     let texture_id = TextureId::from(tex.TexID as usize);
                     if tex.Updates.Size > 0 && !tex.Updates.Data.is_null() {
-                        let rects = std::slice::from_raw_parts(
-                            tex.Updates.Data,
-                            tex.Updates.Size as usize,
-                        );
+                        let rects =
+                            std::slice::from_raw_parts(tex.Updates.Data, tex.Updates.Size as usize);
                         for rect in rects {
                             let x = rect.x as u32;
                             let y = rect.y as u32;
@@ -240,16 +327,7 @@ impl RenderEngine for D3D12RenderEngine {
                                 continue;
                             }
                             self.texture_heap.upload_texture_region(
-                                texture_id,
-                                data,
-                                width,
-                                height,
-                                pitch,
-                                x,
-                                y,
-                                w,
-                                h,
-                                bpp,
+                                texture_id, data, width, height, pitch, x, y, w, h, bpp,
                             )?;
                         }
                     } else if tex.UpdateRect.w != 0 && tex.UpdateRect.h != 0 {
@@ -258,29 +336,11 @@ impl RenderEngine for D3D12RenderEngine {
                         let w = tex.UpdateRect.w as u32;
                         let h = tex.UpdateRect.h as u32;
                         self.texture_heap.upload_texture_region(
-                            texture_id,
-                            data,
-                            width,
-                            height,
-                            pitch,
-                            x,
-                            y,
-                            w,
-                            h,
-                            bpp,
+                            texture_id, data, width, height, pitch, x, y, w, h, bpp,
                         )?;
                     } else {
                         self.texture_heap.upload_texture_region(
-                            texture_id,
-                            data,
-                            width,
-                            height,
-                            pitch,
-                            0,
-                            0,
-                            width,
-                            height,
-                            bpp,
+                            texture_id, data, width, height, pitch, 0, 0, width, height, bpp,
                         )?;
                     }
 
@@ -291,12 +351,38 @@ impl RenderEngine for D3D12RenderEngine {
 
         Ok(())
     }
+
+    fn wait_idle(&mut self) -> Result<()> {
+        for fc in &mut self.frame_contexts {
+            if fc.fence_value != 0 {
+                self.fence.wait_for_value(fc.fence_value)?;
+                fc.fence_value = 0;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for D3D12RenderEngine {
+    fn drop(&mut self) {
+        for fc in &self.frame_contexts {
+            if fc.fence_value != 0 {
+                let _ = self.fence.wait_for_value(fc.fence_value);
+            }
+        }
+    }
 }
 
 impl D3D12RenderEngine {
     unsafe fn render_draw_data(&mut self, draw_data: &DrawData) -> Result<()> {
-        self.vertex_buffer.clear();
-        self.index_buffer.clear();
+        if draw_data.total_vtx_count == 0 {
+            return Ok(());
+        }
+
+        let fc = &mut self.frame_contexts[self.frame_index];
+
+        fc.vertex_buffer.clear();
+        fc.index_buffer.clear();
 
         draw_data
             .draw_lists()
@@ -304,12 +390,12 @@ impl D3D12RenderEngine {
                 (draw_list.vtx_buffer().iter().copied(), draw_list.idx_buffer().iter().copied())
             })
             .for_each(|(vertices, indices)| {
-                self.vertex_buffer.extend(vertices);
-                self.index_buffer.extend(indices);
+                fc.vertex_buffer.extend(vertices);
+                fc.index_buffer.extend(indices);
             });
 
-        self.vertex_buffer.upload(&self.device)?;
-        self.index_buffer.upload(&self.device)?;
+        fc.vertex_buffer.upload(&self.device, self.node_mask)?;
+        fc.index_buffer.upload(&self.device, self.node_mask)?;
 
         self.projection_buffer = {
             let [l, t, r, b] = [
@@ -376,6 +462,8 @@ impl D3D12RenderEngine {
     }
 
     unsafe fn setup_render_state(&self, draw_data: &DrawData) {
+        let fc = &self.frame_contexts[self.frame_index];
+
         self.command_list.RSSetViewports(&[D3D12_VIEWPORT {
             TopLeftX: 0f32,
             TopLeftY: 0f32,
@@ -388,15 +476,15 @@ impl D3D12RenderEngine {
         self.command_list.IASetVertexBuffers(
             0,
             Some(&[D3D12_VERTEX_BUFFER_VIEW {
-                BufferLocation: self.vertex_buffer.resource.GetGPUVirtualAddress(),
-                SizeInBytes: (self.vertex_buffer.data.len() * mem::size_of::<DrawVert>()) as _,
+                BufferLocation: fc.vertex_buffer.resource.GetGPUVirtualAddress(),
+                SizeInBytes: (fc.vertex_buffer.data.len() * mem::size_of::<DrawVert>()) as _,
                 StrideInBytes: mem::size_of::<DrawVert>() as _,
             }]),
         );
 
         self.command_list.IASetIndexBuffer(Some(&D3D12_INDEX_BUFFER_VIEW {
-            BufferLocation: self.index_buffer.resource.GetGPUVirtualAddress(),
-            SizeInBytes: (self.index_buffer.data.len() * mem::size_of::<DrawIdx>()) as _,
+            BufferLocation: fc.index_buffer.resource.GetGPUVirtualAddress(),
+            SizeInBytes: (fc.index_buffer.data.len() * mem::size_of::<DrawIdx>()) as _,
             Format: if mem::size_of::<DrawIdx>() == 2 {
                 DXGI_FORMAT_R16_UINT
             } else {
@@ -416,32 +504,16 @@ impl D3D12RenderEngine {
     }
 }
 
-unsafe fn create_command_objects(
-    command_queue: &ID3D12CommandQueue,
-) -> Result<(ID3D12Device, ID3D12CommandQueue, ID3D12CommandAllocator, ID3D12GraphicsCommandList)> {
-    let device: ID3D12Device = util::try_out_ptr(|v| unsafe { command_queue.GetDevice(v) })?;
-    let command_queue = command_queue.clone();
-
-    let command_allocator: ID3D12CommandAllocator =
-        device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT)?;
-
-    let command_list: ID3D12GraphicsCommandList =
-        device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &command_allocator, None)?;
-    command_list.Close()?;
-
-    command_allocator.SetName(w!("hudhook Render Engine Command Allocator"))?;
-    command_list.SetName(w!("hudhook Render Engine Command List"))?;
-
-    Ok((device, command_queue, command_allocator, command_list))
-}
-
-unsafe fn create_heaps(device: &ID3D12Device) -> Result<(ID3D12DescriptorHeap, TextureHeap)> {
+unsafe fn create_heaps(
+    device: &ID3D12Device,
+    node_mask: u32,
+) -> Result<(ID3D12DescriptorHeap, TextureHeap)> {
     let rtv_heap: ID3D12DescriptorHeap =
         device.CreateDescriptorHeap(&D3D12_DESCRIPTOR_HEAP_DESC {
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
             NumDescriptors: 1,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
-            NodeMask: 1,
+            NodeMask: node_mask,
         })?;
 
     let srv_heap: ID3D12DescriptorHeap =
@@ -449,16 +521,18 @@ unsafe fn create_heaps(device: &ID3D12Device) -> Result<(ID3D12DescriptorHeap, T
             Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
             NumDescriptors: 8,
             Flags: D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE,
-            NodeMask: 0,
+            NodeMask: node_mask,
         })?;
 
-    let texture_heap = TextureHeap::new(device, srv_heap)?;
+    let texture_heap = TextureHeap::new(device, srv_heap, node_mask)?;
 
     Ok((rtv_heap, texture_heap))
 }
 
 unsafe fn create_shader_program(
     device: &ID3D12Device,
+    rtv_format: DXGI_FORMAT,
+    node_mask: u32,
 ) -> Result<(ID3D12RootSignature, ID3D12PipelineState)> {
     let parameters = [
         D3D12_ROOT_PARAMETER {
@@ -527,7 +601,7 @@ unsafe fn create_shader_program(
     .expect("D3D12SerializeRootSignature");
 
     let root_signature: ID3D12RootSignature = device.CreateRootSignature(
-        0,
+        node_mask,
         slice::from_raw_parts(blob.GetBufferPointer() as *const u8, blob.GetBufferSize()),
     )?;
 
@@ -639,14 +713,14 @@ unsafe fn create_shader_program(
 
     let pso_desc = D3D12_GRAPHICS_PIPELINE_STATE_DESC {
         pRootSignature: ManuallyDrop::new(Some(root_signature.clone())),
-        NodeMask: 1,
+        NodeMask: node_mask,
         PrimitiveTopologyType: D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE,
         SampleMask: u32::MAX,
         NumRenderTargets: 1,
         SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
         Flags: D3D12_PIPELINE_STATE_FLAG_NONE,
         RTVFormats: [
-            DXGI_FORMAT_B8G8R8A8_UNORM,
+            rtv_format,
             Default::default(),
             Default::default(),
             Default::default(),
@@ -679,7 +753,7 @@ unsafe fn create_shader_program(
                     DestBlend: D3D12_BLEND_INV_SRC_ALPHA,
                     BlendOp: D3D12_BLEND_OP_ADD,
                     SrcBlendAlpha: D3D12_BLEND_ONE,
-                    DestBlendAlpha: D3D12_BLEND_INV_SRC_ALPHA,
+                    DestBlendAlpha: D3D12_BLEND_ZERO,
                     BlendOpAlpha: D3D12_BLEND_OP_ADD,
                     LogicOp: Default::default(),
                     RenderTargetWriteMask: D3D12_COLOR_WRITE_ENABLE_ALL.0 as _,
@@ -722,22 +796,26 @@ struct Buffer<T: Sized> {
 }
 
 impl<T> Buffer<T> {
-    fn new(device: &ID3D12Device, resource_capacity: usize) -> Result<Self> {
-        let resource = Self::create_resource(device, resource_capacity)?;
+    fn new(device: &ID3D12Device, resource_capacity: usize, node_mask: u32) -> Result<Self> {
+        let resource = Self::create_resource(device, resource_capacity, node_mask)?;
         let data = Vec::with_capacity(resource_capacity);
 
         Ok(Self { resource, resource_capacity, data })
     }
 
-    fn create_resource(device: &ID3D12Device, resource_capacity: usize) -> Result<ID3D12Resource> {
+    fn create_resource(
+        device: &ID3D12Device,
+        resource_capacity: usize,
+        node_mask: u32,
+    ) -> Result<ID3D12Resource> {
         util::try_out_ptr(|v| unsafe {
             device.CreateCommittedResource(
                 &D3D12_HEAP_PROPERTIES {
                     Type: D3D12_HEAP_TYPE_UPLOAD,
                     CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                     MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
-                    CreationNodeMask: 0,
-                    VisibleNodeMask: 0,
+                    CreationNodeMask: node_mask,
+                    VisibleNodeMask: node_mask,
                 },
                 D3D12_HEAP_FLAG_NONE,
                 &D3D12_RESOURCE_DESC {
@@ -767,10 +845,13 @@ impl<T> Buffer<T> {
         self.data.extend(it)
     }
 
-    fn upload(&mut self, device: &ID3D12Device) -> Result<()> {
+    fn upload(&mut self, device: &ID3D12Device, node_mask: u32) -> Result<()> {
         let capacity = self.data.capacity();
         if capacity > self.resource_capacity {
-            drop(mem::replace(&mut self.resource, Self::create_resource(device, capacity)?));
+            drop(mem::replace(
+                &mut self.resource,
+                Self::create_resource(device, capacity, node_mask)?,
+            ));
             self.resource_capacity = capacity;
         }
 
@@ -803,16 +884,17 @@ struct TextureHeap {
     command_allocator: ID3D12CommandAllocator,
     command_list: ID3D12GraphicsCommandList,
     fence: Fence,
+    node_mask: u32,
 }
 
 impl TextureHeap {
-    fn new(device: &ID3D12Device, srv_heap: ID3D12DescriptorHeap) -> Result<Self> {
+    fn new(device: &ID3D12Device, srv_heap: ID3D12DescriptorHeap, node_mask: u32) -> Result<Self> {
         let command_queue = unsafe {
             device.CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
                 Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
                 Priority: 0,
                 Flags: D3D12_COMMAND_QUEUE_FLAG_NONE,
-                NodeMask: 0,
+                NodeMask: node_mask,
             })
         }?;
 
@@ -820,7 +902,12 @@ impl TextureHeap {
             unsafe { device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT) }?;
 
         let command_list: ID3D12GraphicsCommandList = unsafe {
-            device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &command_allocator, None)
+            device.CreateCommandList(
+                node_mask,
+                D3D12_COMMAND_LIST_TYPE_DIRECT,
+                &command_allocator,
+                None,
+            )
         }?;
 
         unsafe {
@@ -834,7 +921,7 @@ impl TextureHeap {
                 Type: D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV,
                 NumDescriptors: 8,
                 Flags: D3D12_DESCRIPTOR_HEAP_FLAG_NONE,
-                NodeMask: 0,
+                NodeMask: node_mask,
             })
         }?;
 
@@ -849,6 +936,7 @@ impl TextureHeap {
             command_allocator,
             command_list,
             fence,
+            node_mask,
         })
     }
 
@@ -924,8 +1012,8 @@ impl TextureHeap {
                     Type: D3D12_HEAP_TYPE_DEFAULT,
                     CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                     MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
-                    CreationNodeMask: Default::default(),
-                    VisibleNodeMask: Default::default(),
+                    CreationNodeMask: self.node_mask,
+                    VisibleNodeMask: self.node_mask,
                 },
                 D3D12_HEAP_FLAG_NONE,
                 &D3D12_RESOURCE_DESC {
@@ -986,19 +1074,11 @@ impl TextureHeap {
     ) -> Result<()> {
         let src_pitch = (width as usize) * 4;
         self.upload_texture_region(
-            texture_id,
-            data,
-            width,
-            height,
-            src_pitch,
-            0,
-            0,
-            width,
-            height,
-            4,
+            texture_id, data, width, height, src_pitch, 0, 0, width, height, 4,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn upload_texture_region(
         &mut self,
         texture_id: TextureId,
@@ -1023,8 +1103,8 @@ impl TextureHeap {
 
         let upload_row_size = w * 4;
         let align = D3D12_TEXTURE_DATA_PITCH_ALIGNMENT;
-        let upload_pitch = upload_row_size.div_ceil(align) * align; // 256 bytes aligned
-        let upload_size = h * upload_pitch;
+        let upload_pitch = upload_row_size.div_ceil(align) * align;
+        let upload_size = height * upload_pitch;
 
         let upload_buffer: ID3D12Resource = util::try_out_ptr(|v| unsafe {
             self.device.CreateCommittedResource(
@@ -1032,8 +1112,8 @@ impl TextureHeap {
                     Type: D3D12_HEAP_TYPE_UPLOAD,
                     CPUPageProperty: D3D12_CPU_PAGE_PROPERTY_UNKNOWN,
                     MemoryPoolPreference: D3D12_MEMORY_POOL_UNKNOWN,
-                    CreationNodeMask: Default::default(),
-                    VisibleNodeMask: Default::default(),
+                    CreationNodeMask: self.node_mask,
+                    VisibleNodeMask: self.node_mask,
                 },
                 D3D12_HEAP_FLAG_NONE,
                 &D3D12_RESOURCE_DESC {
@@ -1114,9 +1194,9 @@ impl TextureHeap {
         self.command_list.ResourceBarrier(&barriers);
         self.command_list.Close()?;
         self.command_queue.ExecuteCommandLists(&[Some(self.command_list.cast()?)]);
-        self.command_queue.Signal(self.fence.fence(), self.fence.value())?;
-        self.fence.wait()?;
-        self.fence.incr();
+        let fence_value = self.fence.incr() + 1;
+        self.command_queue.Signal(self.fence.fence(), fence_value)?;
+        self.fence.wait_for_value(fence_value)?;
 
         barriers.into_iter().for_each(util::drop_barrier);
 
@@ -1128,5 +1208,55 @@ impl TextureHeap {
         let _ = ManuallyDrop::into_inner(dst_location.pResource);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rtv_format_for_swap_chain_accepts_typed_render_target_formats() {
+        assert_eq!(
+            D3D12RenderEngine::rtv_format_for_swap_chain(DXGI_FORMAT_R8G8B8A8_UNORM),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
+        assert_eq!(
+            D3D12RenderEngine::rtv_format_for_swap_chain(DXGI_FORMAT_B8G8R8A8_UNORM),
+            Some(DXGI_FORMAT_B8G8R8A8_UNORM)
+        );
+        assert_eq!(
+            D3D12RenderEngine::rtv_format_for_swap_chain(DXGI_FORMAT_R10G10B10A2_UNORM),
+            Some(DXGI_FORMAT_R10G10B10A2_UNORM)
+        );
+        assert_eq!(
+            D3D12RenderEngine::rtv_format_for_swap_chain(DXGI_FORMAT_R16G16B16A16_FLOAT),
+            Some(DXGI_FORMAT_R16G16B16A16_FLOAT)
+        );
+    }
+
+    #[test]
+    fn rtv_format_for_swap_chain_normalizes_srgb_formats() {
+        assert_eq!(
+            D3D12RenderEngine::rtv_format_for_swap_chain(DXGI_FORMAT_R8G8B8A8_UNORM_SRGB),
+            Some(DXGI_FORMAT_R8G8B8A8_UNORM)
+        );
+        assert_eq!(
+            D3D12RenderEngine::rtv_format_for_swap_chain(DXGI_FORMAT_B8G8R8A8_UNORM_SRGB),
+            Some(DXGI_FORMAT_B8G8R8A8_UNORM)
+        );
+    }
+
+    #[test]
+    fn rtv_format_for_swap_chain_rejects_unknown_and_typeless_formats() {
+        assert_eq!(D3D12RenderEngine::rtv_format_for_swap_chain(DXGI_FORMAT_UNKNOWN), None);
+        assert_eq!(
+            D3D12RenderEngine::rtv_format_for_swap_chain(DXGI_FORMAT_R8G8B8A8_TYPELESS),
+            None
+        );
+        assert_eq!(
+            D3D12RenderEngine::rtv_format_for_swap_chain(DXGI_FORMAT_R10G10B10A2_TYPELESS),
+            None
+        );
     }
 }

@@ -40,8 +40,15 @@ use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 ///
 /// # Example
 ///
-/// ```
-/// let swap_chain_desc = try_out_param(|sd| unsafe { self.swap_chain.GetDesc1(sd) })?;
+/// ```no_run
+/// use hudhook::util::try_out_param;
+/// use windows::Win32::Graphics::Direct3D11::{ID3D11ShaderReflection, D3D11_SHADER_DESC};
+///
+/// fn shader_desc(
+///     reflection: &ID3D11ShaderReflection,
+/// ) -> windows::core::Result<D3D11_SHADER_DESC> {
+///     try_out_param(|sd| unsafe { reflection.GetDesc(sd) })
+/// }
 /// ```
 pub fn try_out_param<T, F, E, O>(mut f: F) -> Result<T, E>
 where
@@ -49,10 +56,7 @@ where
     F: FnMut(&mut T) -> Result<O, E>,
 {
     let mut t: T = Default::default();
-    match f(&mut t) {
-        Ok(_) => Ok(t),
-        Err(e) => Err(e),
-    }
+    f(&mut t).map(|_| t)
 }
 
 /// Helper for fallible [`windows`] APIs that have an optional pointer
@@ -60,7 +64,7 @@ where
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// let dev: ID3D12Device =
 ///     try_out_ptr(|v| unsafe { D3D12CreateDevice(&adapter, D3D_FEATURE_LEVEL_11_0, v) })
 ///         .expect("D3D12CreateDevice failed");
@@ -70,10 +74,7 @@ where
     F: FnMut(&mut Option<T>) -> Result<O, E>,
 {
     let mut t: Option<T> = None;
-    match f(&mut t) {
-        Ok(_) => Ok(t.unwrap()),
-        Err(e) => Err(e),
-    }
+    f(&mut t).map(|_| t.unwrap())
 }
 
 /// Helper for fallible [`windows`] APIs that have an optional pointer
@@ -81,7 +82,7 @@ where
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// let blob: ID3DBlob = util::try_out_err_blob(|v, err_blob| {
 ///     D3D12SerializeRootSignature(
 ///         &root_signature_desc,
@@ -98,17 +99,14 @@ where
 {
     let mut t1: Option<T1> = None;
     let mut t2: Option<T2> = None;
-    match f(&mut t1, &mut t2) {
-        Ok(_) => Ok(t1.unwrap()),
-        Err(e) => Err((e, t2.unwrap())),
-    }
+    f(&mut t1, &mut t2).map(|_| t1.unwrap()).map_err(|e| (e, t2.unwrap()))
 }
 
 /// Helper for infallible APIs that have out-params, like OpenGL 3.
 ///
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// let vertex_buffer = out_param(|x| unsafe { gl.GenBuffers(1, x) });
 /// ```
 pub fn out_param<T: Default, F>(f: F) -> T
@@ -185,7 +183,7 @@ pub fn win_size(hwnd: HWND) -> (i32, i32) {
 
 /// Returns the path of the current module.
 pub fn get_dll_path() -> Option<PathBuf> {
-    let mut hmodule = HMODULE(0);
+    let mut hmodule = HMODULE(std::ptr::null_mut());
     if let Err(e) = unsafe {
         GetModuleHandleExA(
             GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT | GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS,
@@ -198,7 +196,7 @@ pub fn get_dll_path() -> Option<PathBuf> {
     }
 
     let mut sz_filename = [0u16; MAX_PATH as usize];
-    let len = unsafe { GetModuleFileNameW(hmodule, &mut sz_filename) } as usize;
+    let len = unsafe { GetModuleFileNameW(Some(hmodule), &mut sz_filename) } as usize;
 
     Some(OsString::from_wide(&sz_filename[..len]).into())
 }
@@ -268,14 +266,19 @@ impl Fence {
         self.value.load(Ordering::SeqCst)
     }
 
-    /// Atomically increase the fence value.
-    pub fn incr(&self) {
-        self.value.fetch_add(1, Ordering::SeqCst);
+    /// Atomically increase the fence value, returning the previous value.
+    pub fn incr(&self) -> u64 {
+        self.value.fetch_add(1, Ordering::SeqCst)
     }
 
     /// Wait for completion of the fence.
     pub fn wait(&self) -> windows::core::Result<()> {
         let value = self.value();
+        self.wait_for_value(value)
+    }
+
+    /// Wait for a specific fence value to be completed by the GPU.
+    pub fn wait_for_value(&self, value: u64) -> windows::core::Result<()> {
         unsafe {
             if self.fence.GetCompletedValue() < value {
                 self.fence.SetEventOnCompletion(value, self.event)?;
@@ -303,7 +306,8 @@ pub unsafe fn readable_region<T>(ptr: *const T, limit: usize) -> &'static [T] {
         ptr: *const c_void,
         memory_basic_info: &mut MEMORY_BASIC_INFORMATION,
     ) -> bool {
-        // If the page protection has any of these flags set, we can read from it
+        // If the page protection has any of these flags set, we can read from
+        // it
         const PAGE_READABLE: PAGE_PROTECTION_FLAGS = PAGE_PROTECTION_FLAGS(
             PAGE_READONLY.0 | PAGE_READWRITE.0 | PAGE_EXECUTE_READ.0 | PAGE_EXECUTE_READWRITE.0,
         );
@@ -322,8 +326,8 @@ pub unsafe fn readable_region<T>(ptr: *const T, limit: usize) -> &'static [T] {
     };
     let page_align_mask = page_size_bytes - 1;
 
-    // Calculate the starting address of the first and last pages that need to be
-    // readable in order to read `limit` elements of type `T` from `ptr`
+    // Calculate the starting address of the first and last pages that need to
+    // be readable in order to read `limit` elements of type `T` from `ptr`
     let first_page_addr = (ptr as usize) & !page_align_mask;
     let last_page_addr = (ptr as usize + (limit * size_of::<T>()) - 1) & !page_align_mask;
 
@@ -346,8 +350,8 @@ pub unsafe fn readable_region<T>(ptr: *const T, limit: usize) -> &'static [T] {
     }
 
     // SAFETY:
-    // - `ptr` is a valid pointer to `limit` elements of type `T` and is properly
-    //   aligned
+    // - `ptr` is a valid pointer to `limit` elements of type `T` and is
+    //   properly aligned
     std::slice::from_raw_parts(ptr, limit)
 }
 
@@ -407,7 +411,7 @@ mod tests {
 
         let region = unsafe { VirtualAlloc(None, 2 * PAGE_SIZE, MEM_COMMIT, PAGE_READWRITE) };
         if region.is_null() {
-            return Err(windows::core::Error::from_win32());
+            return Err(windows::core::Error::from_thread());
         }
 
         // Make the second page unreadable

@@ -5,7 +5,6 @@ mod keys;
 pub(crate) mod msg_filter;
 mod pipeline;
 
-use imgui::internal::RawCast;
 use imgui::{sys, Context, DrawData, TextureId};
 use windows::core::Result;
 
@@ -22,11 +21,15 @@ pub(crate) trait RenderEngine: RenderContext {
     {
         update_textures(self, draw_data)
     }
+
+    fn wait_idle(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn update_textures(render_context: &mut dyn RenderContext, draw_data: &DrawData) -> Result<()> {
-    let raw_draw_data = unsafe { draw_data.raw() };
-    let textures_ptr = raw_draw_data.Textures;
+    let raw_draw_data = draw_data as *const _ as *const sys::ImDrawData;
+    let textures_ptr = unsafe { (*raw_draw_data).Textures };
     if textures_ptr.is_null() {
         return Ok(());
     }
@@ -36,7 +39,8 @@ fn update_textures(render_context: &mut dyn RenderContext, draw_data: &DrawData)
         return Ok(());
     }
 
-    let textures = unsafe { std::slice::from_raw_parts(textures_vec.Data, textures_vec.Size as usize) };
+    let textures =
+        unsafe { std::slice::from_raw_parts(textures_vec.Data, textures_vec.Size as usize) };
     for &tex_ptr in textures {
         if tex_ptr.is_null() {
             continue;
@@ -65,7 +69,7 @@ fn update_textures(render_context: &mut dyn RenderContext, draw_data: &DrawData)
             let bpp = tex.BytesPerPixel as usize;
             let data = std::slice::from_raw_parts(tex.Pixels, pitch * height_usize);
 
-            let mut rgba_data_storage = Vec::new();
+            let mut rgba_data_storage;
             let upload_data = if bpp == 1 {
                 rgba_data_storage = Vec::with_capacity((width as usize) * (height as usize) * 4);
                 for y in 0..height_usize {

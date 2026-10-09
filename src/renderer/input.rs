@@ -14,6 +14,7 @@ use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::keys::vk_to_imgui;
 use crate::renderer::{Pipeline, RenderEngine};
+use crate::BeforeWndProc;
 
 pub type WndProcType =
     unsafe extern "system" fn(hwnd: HWND, umsg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT;
@@ -73,23 +74,16 @@ fn handle_raw_mouse_input(io: &mut Io, raw_mouse: &RAWMOUSE) {
     event(RI_MOUSE_BUTTON_5_DOWN, MouseButton::Extra2, true);
     event(RI_MOUSE_BUTTON_5_UP, MouseButton::Extra2, false);
 
-    // Apply vertical mouse scroll.
-    let wheel_delta_x = if button_flags & RI_MOUSE_WHEEL != 0 {
-        let wheel_delta = button_data.usButtonData as i16 / WHEEL_DELTA as i16;
-        wheel_delta as f32
-    } else {
-        0.0
+    let wheel_delta = |flag| {
+        if button_flags & flag != 0 {
+            (button_data.usButtonData as i16 / WHEEL_DELTA as i16) as f32
+        } else {
+            0.0
+        }
     };
 
-    // Apply horizontal mouse scroll.
-    let wheel_delta_y = if button_flags & RI_MOUSE_HWHEEL != 0 {
-        let wheel_delta = button_data.usButtonData as i16 / WHEEL_DELTA as i16;
-        wheel_delta as f32
-    } else {
-        0.0
-    };
-
-    io.add_mouse_wheel_event([wheel_delta_x, wheel_delta_y]);
+    // Apply vertical and horizontal mouse scroll.
+    io.add_mouse_wheel_event([wheel_delta(RI_MOUSE_WHEEL), wheel_delta(RI_MOUSE_HWHEEL)]);
 
     let mouse_flags = raw_mouse.usFlags;
     let (last_x, last_y) = (raw_mouse.lLastX as f32, raw_mouse.lLastY as f32);
@@ -139,8 +133,8 @@ fn handle_raw_keyboard_input(io: &mut Io, raw_keyboard: &RAWKEYBOARD) {
         VIRTUAL_KEY(virtual_key) => virtual_key,
     } as usize;
 
-    // If the virtual key is in the allowed array range, set the appropriate status
-    // of key_down for that virtual key.
+    // If the virtual key is in the allowed array range, set the appropriate
+    // status of key_down for that virtual key.
     if virtual_key < 0xFF {
         if let Some(key) = vk_to_imgui(VIRTUAL_KEY(virtual_key as _)) {
             if is_key_down {
@@ -162,7 +156,7 @@ fn handle_raw_input(io: &mut Io, WPARAM(wparam): WPARAM, LPARAM(lparam): LPARAM)
     // Read the raw input data.
     let r = unsafe {
         GetRawInputData(
-            HRAWINPUT(lparam),
+            HRAWINPUT(lparam as *mut c_void),
             RID_INPUT,
             Some(&mut raw_data as *mut _ as *mut c_void),
             &mut raw_data_size,
@@ -277,6 +271,13 @@ pub fn imgui_wnd_proc_impl<T: RenderEngine>(
     LPARAM(lparam): LPARAM,
     pipeline: &mut Pipeline<T>,
 ) {
+    if pipeline.render_loop().before_wnd_proc(hwnd, umsg, WPARAM(wparam), LPARAM(lparam))
+        == BeforeWndProc::Break
+    {
+        pipeline.render_loop().after_wnd_proc(hwnd, umsg, WPARAM(wparam), LPARAM(lparam));
+        return;
+    }
+
     let io = pipeline.context().io_mut();
 
     match umsg {
@@ -342,5 +343,5 @@ pub fn imgui_wnd_proc_impl<T: RenderEngine>(
         _ => {},
     };
 
-    pipeline.render_loop().on_wnd_proc(hwnd, umsg, WPARAM(wparam), LPARAM(lparam));
+    pipeline.render_loop().after_wnd_proc(hwnd, umsg, WPARAM(wparam), LPARAM(lparam));
 }

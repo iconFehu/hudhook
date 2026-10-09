@@ -60,6 +60,7 @@ pub struct HookExample {
     image_vel: [[f32; 2]; IMAGE_COUNT],
     last_upload_time: u64,
     main_window_movable: bool,
+    startup: Instant,
 }
 
 impl HookExample {
@@ -114,6 +115,7 @@ impl HookExample {
             image_vel,
             last_upload_time: 0,
             main_window_movable: true,
+            startup: Instant::now(),
         }
     }
 }
@@ -185,18 +187,27 @@ impl ImguiRenderLoop for HookExample {
                 ui.text("Hello world!");
                 ui.text("こんにちは世界！");
                 ui.text("This...is...imgui-rs!");
-                for y in 0..16 {
+
+                // Display keyboard state using new API
+                ui.text("Keyboard state (showing first 128 key codes):");
+                for y in 0..8 {
                     for x in 0..16 {
-                        let btn = y * 16 + x;
+                        let key_idx = y * 16 + x;
+                        // Access raw KeysData through sys API for display
+                        // purposes
+                        let io_ptr = ui.io() as *const _ as *const imgui::sys::ImGuiIO;
+                        let is_down = unsafe {
+                            if key_idx < 155 {
+                                (*io_ptr).KeysData[key_idx].Down
+                            } else {
+                                false
+                            }
+                        };
                         let _token = ui.push_style_color(
                             StyleColor::Text,
-                            if ui.io().keys_down[btn as usize] {
-                                [0., 1., 0., 1.]
-                            } else {
-                                [1., 1., 1., 1.]
-                            },
+                            if is_down { [0., 1., 0., 1.] } else { [1., 1., 1., 1.] },
                         );
-                        ui.text(format!("{btn:02x}"));
+                        ui.text(format!("{key_idx:02x}"));
                         ui.same_line();
                     }
                     ui.new_line();
@@ -265,6 +276,11 @@ impl ImguiRenderLoop for HookExample {
                     }
                 }
             });
+
+        if self.startup.elapsed() > Duration::from_millis(5000) {
+            println!("Ejecting!");
+            hudhook::eject();
+        }
     }
 
     fn message_filter(&self, _io: &imgui::Io) -> MessageFilter {

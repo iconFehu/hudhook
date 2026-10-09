@@ -4,12 +4,12 @@ use std::ffi::{c_void, CString};
 use std::mem::{self, offset_of};
 
 use gl::types::*;
-use imgui::internal::{RawCast, RawWrapper};
-use imgui::{sys, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
+use imgui::internal::RawWrapper;
+use imgui::{sys, BackendFlags, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
 use once_cell::sync::OnceCell;
 use tracing::error;
 use windows::core::{s, Error, Result, HRESULT, PCSTR};
-use windows::Win32::Foundation::{FARPROC, HINSTANCE};
+use windows::Win32::Foundation::{FARPROC, HMODULE};
 use windows::Win32::Graphics::OpenGL::*;
 use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryA};
 
@@ -34,14 +34,15 @@ mod gl {
 }
 
 unsafe fn load_func(function_string: CString) -> *const c_void {
-    static OPENGL3_LIB: OnceCell<HINSTANCE> = OnceCell::new();
+    static OPENGL3_LIB: OnceCell<usize> = OnceCell::new();
     let module = OPENGL3_LIB
-        .get_or_init(|| LoadLibraryA(s!("opengl32.dll\0")).expect("LoadLibraryA").into());
+        .get_or_init(|| LoadLibraryA(s!("opengl32.dll\0")).expect("LoadLibraryA").0 as usize);
 
     if let Some(wgl_proc_address) = wglGetProcAddress(PCSTR(function_string.as_ptr() as _)) {
         wgl_proc_address as _
     } else {
-        let proc_address: FARPROC = GetProcAddress(*module, PCSTR(function_string.as_ptr() as _));
+        let proc_address: FARPROC =
+            GetProcAddress(HMODULE(*module as *mut c_void), PCSTR(function_string.as_ptr() as _));
         proc_address.unwrap() as _
     }
 }
@@ -81,6 +82,8 @@ impl OpenGl3RenderEngine {
         let texture_heap = TextureHeap::new();
 
         ctx.set_ini_filename(None);
+        ctx.io_mut().backend_flags |=
+            BackendFlags::RENDERER_HAS_VTX_OFFSET | BackendFlags::RENDERER_HAS_TEXTURES;
         ctx.set_renderer_name(String::from(concat!("hudhook-opengl3@", env!("CARGO_PKG_VERSION"))));
 
         Ok(Self {
@@ -129,28 +132,29 @@ impl RenderEngine for OpenGl3RenderEngine {
     }
 
     fn setup_fonts(&mut self, ctx: &mut Context) -> Result<()> {
+        // With Dear ImGui 1.92+ dynamic textures
+        // (BackendFlags::RENDERER_HAS_TEXTURES), the font atlas is
+        // built on-demand through ImTextureData system. We only need to
+        // set up the TexData pointer and initial status.
         let fonts = ctx.fonts();
-        let fonts_texture = fonts.build_rgba32_texture();
-        let texture_id =
-            self.load_texture(fonts_texture.data, fonts_texture.width, fonts_texture.height)?;
-        let fonts_raw = unsafe { fonts.raw_mut() };
+        let fonts_raw = fonts as *const _ as *mut sys::ImFontAtlas;
         let tex_data = unsafe { (*fonts_raw).TexData };
+
+        // ImGui will request texture creation via ImTextureStatus_WantCreate
+        // in update_textures() when the atlas is actually needed
         if !tex_data.is_null() {
             unsafe {
-                sys::ImTextureData_SetTexID(tex_data, texture_id.id() as sys::ImTextureID);
-                sys::ImTextureData_SetStatus(tex_data, sys::ImTextureStatus_OK);
+                // Mark as needing creation - update_textures will handle it
+                sys::ImTextureData_SetStatus(tex_data, sys::ImTextureStatus_WantCreate);
             }
         }
-        fonts.tex_ref = sys::ImTextureRef {
-            _TexData: tex_data,
-            _TexID: texture_id.id() as sys::ImTextureID,
-        };
+
         Ok(())
     }
 
     fn update_textures(&mut self, draw_data: &DrawData) -> Result<()> {
-        let raw_draw_data = unsafe { draw_data.raw() };
-        let textures_ptr = raw_draw_data.Textures;
+        let raw_draw_data = draw_data as *const _ as *const sys::ImDrawData;
+        let textures_ptr = unsafe { (*raw_draw_data).Textures };
         if textures_ptr.is_null() {
             return Ok(());
         }
@@ -187,15 +191,13 @@ impl RenderEngine for OpenGl3RenderEngine {
                 }
 
                 let pitch = sys::ImTextureData_GetPitch(tex_ptr) as usize;
-                let data = std::slice::from_raw_parts(
-                    tex.Pixels as *const u8,
-                    pitch * height as usize,
-                );
+                let data =
+                    std::slice::from_raw_parts(tex.Pixels as *const u8, pitch * height as usize);
                 let bpp = tex.BytesPerPixel as usize;
                 let is_invalid = tex.TexID == 0;
 
                 if status == sys::ImTextureStatus_WantCreate || is_invalid {
-                    let mut upload_storage = Vec::new();
+                    let mut upload_storage;
                     let upload_data = if bpp == 1 || pitch != (width as usize * bpp) {
                         upload_storage = Vec::with_capacity(width as usize * height as usize * 4);
                         for row in 0..height as usize {
@@ -206,9 +208,8 @@ impl RenderEngine for OpenGl3RenderEngine {
                                     let a = data[src_offset];
                                     upload_storage.extend_from_slice(&[255, 255, 255, a]);
                                 } else {
-                                    upload_storage.extend_from_slice(
-                                        &data[src_offset..(src_offset + 4)],
-                                    );
+                                    upload_storage
+                                        .extend_from_slice(&data[src_offset..(src_offset + 4)]);
                                 }
                             }
                         }
@@ -227,10 +228,8 @@ impl RenderEngine for OpenGl3RenderEngine {
                 if status == sys::ImTextureStatus_WantUpdates {
                     let texture_id = TextureId::from(tex.TexID as usize);
                     if tex.Updates.Size > 0 && !tex.Updates.Data.is_null() {
-                        let rects = std::slice::from_raw_parts(
-                            tex.Updates.Data,
-                            tex.Updates.Size as usize,
-                        );
+                        let rects =
+                            std::slice::from_raw_parts(tex.Updates.Data, tex.Updates.Size as usize);
                         for rect in rects {
                             let x = rect.x as u32;
                             let y = rect.y as u32;
@@ -240,17 +239,7 @@ impl RenderEngine for OpenGl3RenderEngine {
                                 continue;
                             }
                             self.texture_heap.update_texture_region(
-                                &self.gl,
-                                texture_id,
-                                data,
-                                width,
-                                height,
-                                pitch,
-                                x,
-                                y,
-                                w,
-                                h,
-                                bpp,
+                                &self.gl, texture_id, data, width, height, pitch, x, y, w, h, bpp,
                             )?;
                         }
                     } else if tex.UpdateRect.w != 0 && tex.UpdateRect.h != 0 {
@@ -259,30 +248,11 @@ impl RenderEngine for OpenGl3RenderEngine {
                         let w = tex.UpdateRect.w as u32;
                         let h = tex.UpdateRect.h as u32;
                         self.texture_heap.update_texture_region(
-                            &self.gl,
-                            texture_id,
-                            data,
-                            width,
-                            height,
-                            pitch,
-                            x,
-                            y,
-                            w,
-                            h,
-                            bpp,
+                            &self.gl, texture_id, data, width, height, pitch, x, y, w, h, bpp,
                         )?;
                     } else {
                         self.texture_heap.update_texture_region(
-                            &self.gl,
-                            texture_id,
-                            data,
-                            width,
-                            height,
-                            pitch,
-                            0,
-                            0,
-                            width,
-                            height,
+                            &self.gl, texture_id, data, width, height, pitch, 0, 0, width, height,
                             bpp,
                         )?;
                     }
@@ -572,20 +542,11 @@ impl TextureHeap {
     ) -> Result<()> {
         let src_pitch = (width as usize) * 4;
         self.update_texture_region(
-            gl,
-            texture,
-            data,
-            width,
-            height,
-            src_pitch,
-            0,
-            0,
-            width,
-            height,
-            4,
+            gl, texture, data, width, height, src_pitch, 0, 0, width, height, 4,
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn update_texture_region(
         &mut self,
         gl: &gl::Gl,

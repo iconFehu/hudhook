@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use imgui::Context;
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::Lazy;
 use parking_lot::Mutex;
-use tracing::error;
-use windows::core::{Error, Result, HRESULT};
+use tracing::{error, warn};
+use windows::core::{Error, Result};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, DefWindowProcW, SetWindowLongPtrW, GWLP_WNDPROC,
@@ -21,12 +21,19 @@ use crate::{util, ImguiRenderLoop, MessageFilter};
 
 type RenderLoop = Box<dyn ImguiRenderLoop + Send + Sync>;
 
-static PIPELINE_STATES: Lazy<Mutex<HashMap<isize, Arc<PipelineSharedState>>>> =
+// Safety: HWND is an opaque integer handle, safe to send/share across threads.
+#[derive(Clone, Copy, Debug)]
+#[repr(transparent)]
+pub(crate) struct SendableHwnd(HWND);
+unsafe impl Send for SendableHwnd {}
+unsafe impl Sync for SendableHwnd {}
+
+static PIPELINE_STATES: Lazy<Mutex<HashMap<usize, Arc<PipelineSharedState>>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug)]
 pub(crate) struct PipelineMessage(
-    pub(crate) HWND,
+    pub(crate) SendableHwnd,
     pub(crate) u32,
     pub(crate) WPARAM,
     pub(crate) LPARAM,
@@ -45,8 +52,8 @@ pub(crate) struct Pipeline<T: RenderEngine> {
     render_loop: RenderLoop,
     rx: Receiver<PipelineMessage>,
     shared_state: Arc<PipelineSharedState>,
-    queue_buffer: OnceCell<Vec<PipelineMessage>>,
-    start_of_first_frame: OnceCell<Instant>,
+    queue_buffer: Vec<PipelineMessage>,
+    last_frame: Option<Instant>,
 }
 
 impl<T: RenderEngine> Pipeline<T> {
@@ -75,7 +82,7 @@ impl<T: RenderEngine> Pipeline<T> {
             mem::transmute::<SwlpRet, WndProcType>(SetWindowLongPtrW(
                 hwnd,
                 GWLP_WNDPROC,
-                pipeline_wnd_proc as usize as _,
+                pipeline_wnd_proc as *const () as _,
             ))
         };
 
@@ -86,9 +93,7 @@ impl<T: RenderEngine> Pipeline<T> {
             tx,
         });
 
-        PIPELINE_STATES.lock().insert(hwnd.0, Arc::clone(&shared_state));
-
-        let queue_buffer = OnceCell::from(Vec::new());
+        PIPELINE_STATES.lock().insert(hwnd.0 as usize, Arc::clone(&shared_state));
 
         Ok(Self {
             hwnd,
@@ -97,19 +102,20 @@ impl<T: RenderEngine> Pipeline<T> {
             render_loop,
             rx,
             shared_state: Arc::clone(&shared_state),
-            queue_buffer,
-            start_of_first_frame: OnceCell::new(),
+            queue_buffer: Vec::new(),
+            last_frame: None,
         })
     }
 
     pub(crate) fn prepare_render(&mut self) -> Result<()> {
-        let mut queue_buffer = self.queue_buffer.take().unwrap();
-        queue_buffer.clear();
+        let mut queue_buffer = mem::take(&mut self.queue_buffer);
         queue_buffer.extend(self.rx.try_iter());
-        queue_buffer.drain(..).for_each(|PipelineMessage(hwnd, umsg, wparam, lparam)| {
-            imgui_wnd_proc_impl(hwnd, umsg, wparam, lparam, self);
-        });
-        self.queue_buffer.set(queue_buffer).expect("OnceCell should be empty");
+        queue_buffer.drain(..).for_each(
+            |PipelineMessage(SendableHwnd(hwnd), umsg, wparam, lparam)| {
+                imgui_wnd_proc_impl(hwnd, umsg, wparam, lparam, self);
+            },
+        );
+        self.queue_buffer = queue_buffer;
 
         let message_filter = self.render_loop.message_filter(self.ctx.io());
 
@@ -126,11 +132,9 @@ impl<T: RenderEngine> Pipeline<T> {
     }
 
     pub(crate) fn render(&mut self, render_target: T::RenderTarget) -> Result<()> {
-        let delta_time = Instant::now()
-            .checked_duration_since(*self.start_of_first_frame.get_or_init(Instant::now))
-            .unwrap_or(Duration::ZERO)
-            .checked_sub(Duration::from_secs_f64(self.ctx.time()))
-            .unwrap_or(Duration::ZERO);
+        let now = Instant::now();
+        let delta_time = self.last_frame.map_or(Duration::ZERO, |last| now - last);
+        self.last_frame = Some(now);
 
         self.ctx.io_mut().update_delta_time(delta_time);
 
@@ -138,8 +142,11 @@ impl<T: RenderEngine> Pipeline<T> {
         let [fsw, fsh] = self.ctx.io().display_framebuffer_scale;
 
         if (w * fsw) <= 0.0 || (h * fsh) <= 0.0 {
-            error!("Insufficient display size: {w}x{h}");
-            return Err(Error::from_hresult(HRESULT(-1)));
+            warn!(
+                "Insufficient display size: {w}x{h}, framebuffer_scale: {fsw}x{fsh}; skipping \
+                 frame"
+            );
+            return Ok(());
         }
 
         let ui = self.ctx.frame();
@@ -161,13 +168,24 @@ impl<T: RenderEngine> Pipeline<T> {
     }
 
     pub(crate) fn resize(&mut self, width: u32, height: u32) {
-        self.ctx.io_mut().display_size = [width as f32, height as f32];
+        if width > 0 && height > 0 {
+            self.ctx.io_mut().display_size = [width as f32, height as f32];
+        }
+    }
+
+    pub(crate) fn update_display_size_from_swap_chain(&mut self, width: u32, height: u32) {
+        self.resize(width, height);
+    }
+
+    pub(crate) fn wait_idle(&mut self) -> Result<()> {
+        self.engine.wait_idle()
     }
 
     pub(crate) fn cleanup(&mut self) {
         unsafe {
             SetWindowLongPtrW(self.hwnd, GWLP_WNDPROC, self.shared_state.wnd_proc as usize as _)
         };
+        PIPELINE_STATES.lock().remove(&(self.hwnd.0 as usize));
     }
 
     pub(crate) fn take(mut self) -> RenderLoop {
@@ -188,7 +206,7 @@ unsafe extern "system" fn pipeline_wnd_proc(
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         };
 
-        let Some(shared_state) = shared_state_guard.get(&hwnd.0) else {
+        let Some(shared_state) = shared_state_guard.get(&(hwnd.0 as usize)) else {
             error!("Could not get shared state for handle {hwnd:?}");
             return DefWindowProcW(hwnd, msg, wparam, lparam);
         };
@@ -196,7 +214,7 @@ unsafe extern "system" fn pipeline_wnd_proc(
         Arc::clone(shared_state)
     };
 
-    if let Err(e) = shared_state.tx.send(PipelineMessage(hwnd, msg, wparam, lparam)) {
+    if let Err(e) = shared_state.tx.send(PipelineMessage(SendableHwnd(hwnd), msg, wparam, lparam)) {
         error!("Could not send window message through pipeline: {e:?}");
     }
 

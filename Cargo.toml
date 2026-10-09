@@ -1,7 +1,8 @@
 [package]
 name = "hudhook"
-version = "0.8.2"
+version = "0.9.3"
 edition = "2021"
+rust-version = "1.85"
 description = "A graphics API hook with dear imgui render loop. Supports DirectX 9, 11, 12, and OpenGL 3."
 homepage = "https://github.com/veeenu/hudhook"
 repository = "https://github.com/veeenu/hudhook"
@@ -13,8 +14,8 @@ authors = ["Andrea Venuta <venutawebdesign@gmail.com>"]
 default-target = "x86_64-pc-windows-gnu"
 targets = [
   "x86_64-pc-windows-msvc",
-  "i686-pc-windows-msvc", 
-  "x86_64-pc-windows-gnu", 
+  "i686-pc-windows-msvc",
+  "x86_64-pc-windows-gnu",
   "i686-pc-windows-gnu"
 ]
 
@@ -64,11 +65,11 @@ once_cell = { version = "1.18.0", default-features = false }
 parking_lot = "0.12"
 tracing = { version = "0.1", features = ["log"], default-features = false }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], default-features = false }
+windows-numerics = "0.3"
 
 [dependencies.windows]
-version = "0.54.0"
+version = "0.62"
 features = [
-  "Foundation_Numerics",
   "Win32_Devices_HumanInterfaceDevice",
   "Win32_Foundation",
   "Win32_Graphics_Direct3D11",
@@ -91,7 +92,8 @@ features = [
   "Win32_System_Threading",
   "Win32_UI_Input_KeyboardAndMouse",
   "Win32_UI_WindowsAndMessaging",
-] 
+  "Win32_UI_HiDpi",
+]
 
 [dev-dependencies]
 dotenv = "0.15.0"
@@ -107,6 +109,7 @@ opt-level = 3
 overflow-checks = false
 lto = "thin"
 
-# TODO: remove this once the fix to imgui-rs/imgui-rs#775 gets released.
+# Patch pins iconFehu/imgui-rs fork (Dear ImGui v1.92.9b, rev 229a47d) because crates.io imgui 0.12 is outdated.
+# This fork includes ABI fixes for ImWchar=32-bit and IMGUI_DISABLE_OBSOLETE_FUNCTIONS.
 [patch.'crates-io']
-imgui = { git = "https://github.com/iconFehu/imgui-rs", rev = "cd0f35c" }
+imgui = { git = "https://github.com/iconFehu/imgui-rs", rev = "229a47d" }

@@ -591,6 +591,60 @@ impl HudhookBuilder {
     }
 }
 
+/// Entry point generator for the library.
+///
+/// After implementing your [render loop](crate::hooks) of choice, invoke
+/// the macro to generate the `DllMain` function that will serve as entry point
+/// for your hook.
+///
+/// Example usage:
+/// ```no_run
+/// use hudhook::hooks::dx12::ImguiDx12Hooks;
+/// use hudhook::*;
+///
+/// pub struct MyRenderLoop;
+///
+/// impl ImguiRenderLoop for MyRenderLoop {
+///     fn render(&mut self, frame: &mut imgui::Ui) {
+///         // ...
+///     }
+/// }
+///
+/// hudhook::hudhook!(ImguiDx12Hooks, MyRenderLoop);
+/// ```
+#[macro_export]
+macro_rules! hudhook {
+    ($t:ty, $hooks:expr) => {
+        /// Entry point created by the `hudhook` library.
+        #[no_mangle]
+        pub unsafe extern "system" fn DllMain(
+            hmodule: ::hudhook::windows::Win32::Foundation::HINSTANCE,
+            reason: u32,
+            _: *mut ::std::ffi::c_void,
+        ) {
+            use ::hudhook::*;
+
+            if reason == ::hudhook::windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH {
+                ::hudhook::tracing::trace!("DllMain()");
+                let hmodule_raw = hmodule.0 as usize;
+                ::std::thread::spawn(move || {
+                    let hmodule =
+                        ::hudhook::windows::Win32::Foundation::HINSTANCE(hmodule_raw as _);
+                    if let Err(e) = ::hudhook::Hudhook::builder()
+                        .with::<$t>({ $hooks })
+                        .with_hmodule(hmodule)
+                        .build()
+                        .apply()
+                    {
+                        ::hudhook::tracing::error!("Couldn't apply hooks: {e:?}");
+                        ::hudhook::eject();
+                    }
+                });
+            }
+        }
+    };
+}
+
 #[cfg(test)]
 mod owned_lifecycle_tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -645,58 +699,4 @@ mod owned_lifecycle_tests {
         assert_eq!(released.load(Ordering::Relaxed), 1);
         assert_eq!(hook.hooks.len(), 1);
     }
-}
-
-/// Entry point generator for the library.
-///
-/// After implementing your [render loop](crate::hooks) of choice, invoke
-/// the macro to generate the `DllMain` function that will serve as entry point
-/// for your hook.
-///
-/// Example usage:
-/// ```no_run
-/// use hudhook::hooks::dx12::ImguiDx12Hooks;
-/// use hudhook::*;
-///
-/// pub struct MyRenderLoop;
-///
-/// impl ImguiRenderLoop for MyRenderLoop {
-///     fn render(&mut self, frame: &mut imgui::Ui) {
-///         // ...
-///     }
-/// }
-///
-/// hudhook::hudhook!(ImguiDx12Hooks, MyRenderLoop);
-/// ```
-#[macro_export]
-macro_rules! hudhook {
-    ($t:ty, $hooks:expr) => {
-        /// Entry point created by the `hudhook` library.
-        #[no_mangle]
-        pub unsafe extern "system" fn DllMain(
-            hmodule: ::hudhook::windows::Win32::Foundation::HINSTANCE,
-            reason: u32,
-            _: *mut ::std::ffi::c_void,
-        ) {
-            use ::hudhook::*;
-
-            if reason == ::hudhook::windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH {
-                ::hudhook::tracing::trace!("DllMain()");
-                let hmodule_raw = hmodule.0 as usize;
-                ::std::thread::spawn(move || {
-                    let hmodule =
-                        ::hudhook::windows::Win32::Foundation::HINSTANCE(hmodule_raw as _);
-                    if let Err(e) = ::hudhook::Hudhook::builder()
-                        .with::<$t>({ $hooks })
-                        .with_hmodule(hmodule)
-                        .build()
-                        .apply()
-                    {
-                        ::hudhook::tracing::error!("Couldn't apply hooks: {e:?}");
-                        ::hudhook::eject();
-                    }
-                });
-            }
-        }
-    };
 }

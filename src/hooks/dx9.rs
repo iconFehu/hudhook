@@ -263,7 +263,8 @@ impl Hooks for ImguiDx9Hooks {
         if let Some(pipeline) = PIPELINE.take() {
             match pipeline.into_inner().take_resident() {
                 Ok(render_loop) => drop(render_loop),
-                Err((error, pipeline)) => {
+                Err(boxed_err) => {
+                    let (error, pipeline) = *boxed_err;
                     let _ = PIPELINE.set(Mutex::new(pipeline));
                     return Err(error);
                 },

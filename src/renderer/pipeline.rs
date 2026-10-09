@@ -207,9 +207,9 @@ impl<T: RenderEngine> Pipeline<T> {
         self.render_loop
     }
 
-    pub(crate) fn take_resident(mut self) -> std::result::Result<RenderLoop, (Error, Self)> {
+    pub(crate) fn take_resident(mut self) -> std::result::Result<RenderLoop, Box<(Error, Self)>> {
         if let Err(error) = self.detach_window_procedure() {
-            return Err((error, self));
+            return Err(Box::new((error, self)));
         }
         self.shared_state.message_filter.store(MessageFilter::empty().bits(), Ordering::SeqCst);
         // Preserve PIPELINE_STATES so a late window callback can still find

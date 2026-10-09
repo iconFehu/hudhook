@@ -3,7 +3,7 @@
 use std::{mem, ptr};
 
 use imgui::internal::RawWrapper;
-use imgui::{BackendFlags, Context, DrawCmd, DrawData, DrawIdx, TextureId};
+use imgui::{sys, BackendFlags, Context, DrawCmd, DrawData, DrawIdx, TextureId};
 use tracing::error;
 use windows::core::{Error, Result, HRESULT};
 use windows::Win32::Foundation::RECT;
@@ -110,7 +110,7 @@ impl RenderEngine for D3D9RenderEngine {
         let fonts_texture = fonts.build_rgba32_texture();
         let texture_id =
             self.load_texture(fonts_texture.data, fonts_texture.width, fonts_texture.height)?;
-        let fonts_raw = unsafe { fonts.raw_mut() };
+        let fonts_raw = fonts as *const _ as *mut sys::ImFontAtlas;
         let tex_data = unsafe { (*fonts_raw).TexData };
         if !tex_data.is_null() {
             unsafe {
@@ -126,8 +126,8 @@ impl RenderEngine for D3D9RenderEngine {
     }
 
     fn update_textures(&mut self, draw_data: &DrawData) -> Result<()> {
-        let raw_draw_data = unsafe { draw_data.raw() };
-        let textures_ptr = raw_draw_data.Textures;
+        let raw_draw_data = draw_data as *const _ as *const sys::ImDrawData;
+        let textures_ptr = unsafe { (*raw_draw_data).Textures };
         if textures_ptr.is_null() {
             return Ok(());
         }
@@ -559,6 +559,34 @@ impl TextureHeap {
         width: u32,
         height: u32,
     ) -> Result<()> {
+        let src_pitch = (width as usize) * 4;
+        self.upload_texture_region(
+            texture_id,
+            data,
+            width,
+            height,
+            src_pitch,
+            0,
+            0,
+            width,
+            height,
+            4,
+        )
+    }
+
+    unsafe fn upload_texture_region(
+        &mut self,
+        texture_id: TextureId,
+        data: &[u8],
+        width: u32,
+        height: u32,
+        src_pitch: usize,
+        x: u32,
+        y: u32,
+        w: u32,
+        h: u32,
+        bpp: usize,
+    ) -> Result<()> {
         let texture = &self.textures[texture_id.id()];
         if texture.width != width || texture.height != height {
             error!(
@@ -569,22 +597,38 @@ impl TextureHeap {
         }
 
         let mut r: D3DLOCKED_RECT = Default::default();
-        texture.resource.LockRect(0, &mut r, ptr::null_mut(), 0)?;
+        let rect = RECT {
+            left: x as i32,
+            top: y as i32,
+            right: (x + w) as i32,
+            bottom: (y + h) as i32,
+        };
+        texture.resource.LockRect(0, &mut r, &rect, 0)?;
 
         let bits = r.pBits as *mut u8;
-        let pitch = r.Pitch as usize;
-        let height = height as usize;
-        let width = width as usize;
+        let dst_pitch = r.Pitch as usize;
+        let region_height = h as usize;
+        let region_width = w as usize;
 
         // CPU swizzle FTW
-        for y in 0..height {
-            for x in 0..width {
-                let offset_dest = pitch * y + x * 4;
-                let offset_src = width * 4 * y + x * 4;
-                *bits.add(offset_dest) = data[offset_src + 2];
-                *bits.add(offset_dest + 1) = data[offset_src + 1];
-                *bits.add(offset_dest + 2) = data[offset_src];
-                *bits.add(offset_dest + 3) = data[offset_src + 3];
+        for row in 0..region_height {
+            let src_row = (y as usize + row) * src_pitch;
+            let dst_row = row * dst_pitch;
+            for col in 0..region_width {
+                let offset_dest = dst_row + col * 4;
+                let src_offset = src_row + ((x as usize + col) * bpp);
+                if bpp == 1 {
+                    let a = data[src_offset];
+                    *bits.add(offset_dest) = 255;
+                    *bits.add(offset_dest + 1) = 255;
+                    *bits.add(offset_dest + 2) = 255;
+                    *bits.add(offset_dest + 3) = a;
+                } else {
+                    *bits.add(offset_dest) = data[src_offset + 2];
+                    *bits.add(offset_dest + 1) = data[src_offset + 1];
+                    *bits.add(offset_dest + 2) = data[src_offset];
+                    *bits.add(offset_dest + 3) = data[src_offset + 3];
+                }
             }
         }
 

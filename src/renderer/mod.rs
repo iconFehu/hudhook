@@ -29,8 +29,8 @@ pub(crate) trait RenderEngine: RenderContext {
 }
 
 fn update_textures(render_context: &mut dyn RenderContext, draw_data: &DrawData) -> Result<()> {
-    let raw_draw_data = unsafe { draw_data.raw() };
-    let textures_ptr = raw_draw_data.Textures;
+    let raw_draw_data = draw_data as *const _ as *const sys::ImDrawData;
+    let textures_ptr = unsafe { (*raw_draw_data).Textures };
     if textures_ptr.is_null() {
         return Ok(());
     }

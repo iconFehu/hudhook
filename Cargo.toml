@@ -109,6 +109,7 @@ opt-level = 3
 overflow-checks = false
 lto = "thin"
 
-# TODO: remove this once the fix to imgui-rs/imgui-rs#775 gets released.
+# Patch pins iconFehu/imgui-rs fork (Dear ImGui v1.92.9b) because crates.io imgui 0.12 is outdated.
+# This fork includes ABI fixes for ImWchar=32-bit and IMGUI_DISABLE_OBSOLETE_FUNCTIONS.
 [patch.'crates-io']
 imgui = { git = "https://github.com/iconFehu/imgui-rs", rev = "3bbe874" }

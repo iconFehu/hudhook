@@ -819,6 +819,7 @@ impl TextureHeap {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn update_texture_region(
         &mut self,
         texture_id: TextureId,
@@ -854,7 +855,7 @@ impl TextureHeap {
                     upload_storage.extend_from_slice(&[255, 255, 255, a]);
                 }
             }
-            (upload_storage.as_ptr(), (w * 4) as u32)
+            (upload_storage.as_ptr(), w * 4)
         } else {
             (src_ptr, src_pitch as u32)
         };

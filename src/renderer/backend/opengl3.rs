@@ -546,6 +546,7 @@ impl TextureHeap {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn update_texture_region(
         &mut self,
         gl: &gl::Gl,

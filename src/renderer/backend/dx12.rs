@@ -1078,6 +1078,7 @@ impl TextureHeap {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn upload_texture_region(
         &mut self,
         texture_id: TextureId,

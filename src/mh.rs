@@ -51,6 +51,7 @@ extern "system" {
         pDetour: *mut c_void,
         ppOriginal: *mut *mut c_void,
     ) -> MH_STATUS;
+    pub fn MH_RemoveHook(pTarget: *mut c_void) -> MH_STATUS;
     pub fn MH_EnableHook(pTarget: *mut c_void) -> MH_STATUS;
     pub fn MH_QueueEnableHook(pTarget: *mut c_void) -> MH_STATUS;
     pub fn MH_DisableHook(pTarget: *mut c_void) -> MH_STATUS;
@@ -112,5 +113,15 @@ impl MhHook {
     /// Most definitely undefined behavior.
     pub unsafe fn queue_disable(&self) -> Result<(), MH_STATUS> {
         MH_QueueDisableHook(self.addr).ok_context("MH_QueueDisableHook")
+    }
+
+    /// # Safety
+    /// The hook must be disabled and every callback using its trampoline must
+    /// have returned before removing its MinHook record.
+    pub unsafe fn remove(&self) -> Result<(), MH_STATUS> {
+        match MH_RemoveHook(self.addr) {
+            MH_STATUS::MH_OK | MH_STATUS::MH_ERROR_NOT_CREATED => Ok(()),
+            status => status.ok_context("MH_RemoveHook"),
+        }
     }
 }

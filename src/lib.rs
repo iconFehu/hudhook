@@ -116,6 +116,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
+use std::time::Duration;
 
 pub use imgui;
 use imgui::{Context, Io, TextureId, Ui};
@@ -335,6 +336,28 @@ pub trait Hooks {
     /// Return the list of hooks to be enabled, in order.
     fn hooks(&self) -> &[MhHook];
 
+    /// Stop creating renderer resources before disabling this hook set.
+    fn begin_shutdown(&mut self) {}
+
+    /// Route teardown through the owner instead of the global eject request.
+    fn use_owned_lifecycle(&mut self) {}
+
+    /// Restore window procedures while retaining their forwarding state.
+    /// Call this after disabling hooks and waiting for render callbacks.
+    fn detach_window_procedures(&mut self) -> Result<(), Error> {
+        Err(Error::from_hresult(windows::core::HRESULT(0x80004001u32 as i32)))
+    }
+
+    /// Release renderer resources while retaining callback forwarding code,
+    /// original functions, and disabled MinHook records for a resident DLL.
+    ///
+    /// # Safety
+    /// Rendering must have stopped, window procedures must have been detached,
+    /// and callbacks using renderer resources must have returned.
+    unsafe fn release_render_resources(&mut self) -> Result<(), Error> {
+        Err(Error::from_hresult(windows::core::HRESULT(0x80004001u32 as i32)))
+    }
+
     /// Cleanup global data and disable the hooks.
     ///
     /// # Safety
@@ -344,7 +367,11 @@ pub trait Hooks {
 }
 
 /// Holds all the activated hooks and manages their lifetime.
-pub struct Hudhook(Vec<Box<dyn Hooks>>);
+pub struct Hudhook {
+    hooks: Vec<Box<dyn Hooks>>,
+    active: bool,
+    window_procedures_detached: bool,
+}
 unsafe impl Send for Hudhook {}
 unsafe impl Sync for Hudhook {}
 
@@ -365,16 +392,36 @@ impl Hudhook {
             _ => unreachable!(),
         }
 
-        Hudhook(Vec::new())
+        Hudhook { hooks: Vec::new(), active: false, window_procedures_detached: false }
     }
 
     /// Return an iterator of all the activated raw hooks.
     fn hooks(&self) -> impl IntoIterator<Item = &MhHook> {
-        self.0.iter().flat_map(|h| h.hooks())
+        self.hooks.iter().flat_map(|h| h.hooks())
     }
 
     /// Apply the hooks.
-    pub fn apply(self) -> Result<(), MH_STATUS> {
+    pub fn apply(mut self) -> Result<(), MH_STATUS> {
+        self.enable()?;
+
+        unsafe { HUDHOOK.set(self).ok() };
+
+        Ok(())
+    }
+
+    /// Enable hooks while retaining ownership in the caller. This does not
+    /// register an eject handler or transfer ownership of the containing DLL.
+    pub fn apply_owned(&mut self) -> Result<(), MH_STATUS> {
+        for hook in &mut self.hooks {
+            hook.use_owned_lifecycle();
+        }
+        self.enable()
+    }
+
+    fn enable(&mut self) -> Result<(), MH_STATUS> {
+        if self.active {
+            return Ok(());
+        }
         // Queue enabling all the hooks.
         for hook in self.hooks() {
             unsafe { hook.queue_enable()? };
@@ -383,8 +430,81 @@ impl Hudhook {
         // Apply the queue of enable actions.
         unsafe { MH_ApplyQueued().ok_context("MH_ApplyQueued")? };
 
-        unsafe { HUDHOOK.set(self).ok() };
+        self.active = true;
+        self.window_procedures_detached = false;
 
+        Ok(())
+    }
+
+    /// Disable hook entry points without releasing trampolines or renderers.
+    /// The caller must also detach window procedures and drain callbacks
+    /// before calling [`Self::cleanup_owned`].
+    pub fn disable(&mut self) -> Result<(), MH_STATUS> {
+        for hook in &mut self.hooks {
+            hook.begin_shutdown();
+        }
+        for hook in self.hooks() {
+            unsafe { hook.queue_disable()? };
+        }
+        unsafe { MH_ApplyQueued().ok_context("MH_ApplyQueued")? };
+        self.active = false;
+        Ok(())
+    }
+
+    /// Wait for guarded render/window callbacks to return. Use once after
+    /// [`Self::disable`], then again after detaching window procedures.
+    /// This coordinates resource cleanup; it does not prove the containing
+    /// DLL can be unmapped, since callers may have cached detour addresses.
+    pub fn wait_for_idle(&self, timeout: Duration) -> bool {
+        HOOK_EJECTION_BARRIER.wait_for_all_guards_timeout(timeout)
+    }
+
+    /// Restore window procedures without freeing state used by callbacks.
+    /// A later subclass in the window procedure chain causes an error; keep
+    /// this instance and its containing DLL loaded in that case. Currently
+    /// supported by DirectX 9; other hook sets must implement detachment.
+    pub fn detach_window_procedures(&mut self) -> Result<(), Error> {
+        for hook in &mut self.hooks {
+            hook.detach_window_procedures()?;
+        }
+        self.window_procedures_detached = true;
+        Ok(())
+    }
+
+    /// Release stopped renderer resources while keeping callback forwarding
+    /// state and disabled hooks resident. Use after disabling hooks, draining
+    /// callbacks, detaching window procedures, and draining callbacks again.
+    /// The containing DLL must remain loaded after this logical shutdown.
+    pub fn release_owned_renderers(&mut self) -> Result<(), Error> {
+        if self.active || !self.window_procedures_detached || !self.wait_for_idle(Duration::ZERO) {
+            return Err(Error::from_hresult(windows::core::HRESULT(0x80004005u32 as i32)));
+        }
+        for hook in &mut self.hooks {
+            unsafe { hook.release_render_resources()? };
+        }
+        Ok(())
+    }
+
+    /// Remove this instance's MinHook records and release renderer resources.
+    /// Other users of the process-wide MinHook library remain initialized.
+    ///
+    /// # Safety
+    /// Hook entry points and window procedures must have been detached and
+    /// all callbacks drained. This must not run from a hook callback.
+    /// Cached detour/trampoline addresses and callbacks outside the guards
+    /// must also be ruled out by the caller; `wait_for_idle` alone is not
+    /// sufficient. Prefer [`Self::release_owned_renderers`] for resident DLLs.
+    pub unsafe fn cleanup_owned(&mut self) -> Result<(), MH_STATUS> {
+        if self.active {
+            return Err(MH_STATUS::MH_ERROR_ENABLED);
+        }
+        for hook in self.hooks() {
+            hook.remove()?;
+        }
+        for hook in &mut self.hooks {
+            hook.unhook();
+        }
+        self.hooks.clear();
         Ok(())
     }
 
@@ -403,7 +523,7 @@ impl Hudhook {
         unsafe { MH_Uninitialize().ok_context("MH_Uninitialize")? };
 
         // Invoke cleanup for all hooks.
-        for hook in &mut self.0 {
+        for hook in &mut self.hooks {
             unsafe { hook.unhook() };
         }
         trace!("Finished removing hook");
@@ -455,7 +575,7 @@ impl HudhookBuilder {
         mut self,
         render_loop: impl ImguiRenderLoop + Send + Sync + 'static,
     ) -> Self {
-        self.0 .0.push(T::from_render_loop(render_loop));
+        self.0.hooks.push(T::from_render_loop(render_loop));
         self
     }
 
@@ -468,6 +588,62 @@ impl HudhookBuilder {
     /// Build the [`Hudhook`] object.
     pub fn build(self) -> Hudhook {
         self.0
+    }
+}
+
+#[cfg(test)]
+mod owned_lifecycle_tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use super::*;
+
+    struct ResidentHooks(Arc<AtomicUsize>);
+
+    impl Hooks for ResidentHooks {
+        fn from_render_loop<T>(_: T) -> Box<Self>
+        where
+            Self: Sized,
+            T: ImguiRenderLoop + Send + Sync + 'static,
+        {
+            unreachable!()
+        }
+
+        fn hooks(&self) -> &[MhHook] {
+            &[]
+        }
+
+        fn detach_window_procedures(&mut self) -> Result<(), Error> {
+            Ok(())
+        }
+
+        unsafe fn release_render_resources(&mut self) -> Result<(), Error> {
+            self.0.fetch_add(1, Ordering::Relaxed);
+            Ok(())
+        }
+
+        unsafe fn unhook(&mut self) {
+            panic!("Resident shutdown must preserve callback forwarding state");
+        }
+    }
+
+    #[test]
+    fn resident_release_requires_detach_and_idle_callbacks() {
+        let released = Arc::new(AtomicUsize::new(0));
+        let mut hook = Hudhook {
+            hooks: vec![Box::new(ResidentHooks(Arc::clone(&released)))],
+            active: false,
+            window_procedures_detached: false,
+        };
+        assert!(hook.release_owned_renderers().is_err());
+        hook.detach_window_procedures().unwrap();
+        let callback = HOOK_EJECTION_BARRIER.acquire_ejection_guard();
+        assert!(hook.release_owned_renderers().is_err());
+        assert_eq!(released.load(Ordering::Relaxed), 0);
+        drop(callback);
+        hook.release_owned_renderers().unwrap();
+        assert_eq!(released.load(Ordering::Relaxed), 1);
+        assert_eq!(hook.hooks.len(), 1);
     }
 }
 

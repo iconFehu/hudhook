@@ -7,6 +7,7 @@ use std::mem::{size_of, ManuallyDrop};
 use std::os::windows::ffi::OsStringExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
 
 use parking_lot::{RwLock, RwLockReadGuard};
 use tracing::{debug, error};
@@ -391,6 +392,13 @@ impl HookEjectionBarrier {
         // need to ensure that all read locks have also been dropped.
         let _wait_guard = self.0.write();
     }
+
+    /// Wait up to `timeout` for callbacks to return. Entry points must be
+    /// disabled before treating a successful wait as safe for resource
+    /// cleanup. A successful wait alone does not make DLL unmapping safe.
+    pub fn wait_for_all_guards_timeout(&self, timeout: Duration) -> bool {
+        self.0.try_write_for(timeout).is_some()
+    }
 }
 
 impl Default for HookEjectionBarrier {
@@ -401,9 +409,42 @@ impl Default for HookEjectionBarrier {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+
     use windows::Win32::System::Memory::{VirtualAlloc, VirtualProtect, MEM_COMMIT, PAGE_NOACCESS};
 
     use super::*;
+
+    #[test]
+    fn ejection_timeout_retains_live_callbacks() {
+        let barrier = Arc::new(HookEjectionBarrier::new());
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let callback_barrier = Arc::clone(&barrier);
+        let callback = thread::spawn(move || {
+            let _guard = callback_barrier.acquire_ejection_guard();
+            entered_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+        });
+
+        entered_rx.recv().unwrap();
+        assert!(!barrier.wait_for_all_guards_timeout(Duration::from_millis(10)));
+        release_tx.send(()).unwrap();
+        callback.join().unwrap();
+        assert!(barrier.wait_for_all_guards_timeout(Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn ejection_waits_for_every_callback() {
+        let barrier = HookEjectionBarrier::new();
+        let first = barrier.acquire_ejection_guard();
+        let second = barrier.acquire_ejection_guard();
+        drop(first);
+        assert!(!barrier.wait_for_all_guards_timeout(Duration::ZERO));
+        drop(second);
+        assert!(barrier.wait_for_all_guards_timeout(Duration::ZERO));
+    }
 
     #[test]
     fn test_readable_region() -> windows::core::Result<()> {

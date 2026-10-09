@@ -2,7 +2,7 @@
 
 use std::ffi::c_void;
 use std::mem;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use imgui::Context;
@@ -42,6 +42,8 @@ struct Trampolines {
 static mut TRAMPOLINES: OnceLock<Trampolines> = OnceLock::new();
 static mut PIPELINE: OnceCell<Mutex<Pipeline<D3D9RenderEngine>>> = OnceCell::new();
 static mut RENDER_LOOP: OnceCell<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceCell::new();
+static STOPPING: AtomicBool = AtomicBool::new(false);
+static OWNED_LIFECYCLE: AtomicBool = AtomicBool::new(false);
 
 unsafe fn init_pipeline(device: &IDirect3DDevice9) -> Result<Mutex<Pipeline<D3D9RenderEngine>>> {
     trace!("initializing pipeline");
@@ -98,13 +100,15 @@ unsafe extern "system" fn dx9_present_impl(
     let Trampolines { dx9_present, .. } =
         TRAMPOLINES.get().expect("DirectX 9 trampolines uninitialized");
 
-    if let Err(e) = render(&device) {
-        error!("Render error: {e:?}");
+    if !STOPPING.load(Ordering::Acquire) {
+        if let Err(e) = render(&device) {
+            error!("Render error: {e:?}");
+        }
     }
 
     trace!("Call IDirect3DDevice9::Present trampoline");
     let result = dx9_present(device, psourcerect, pdestrect, hdestwindowoverride, pdirtyregion);
-    if EJECT_REQUESTED.load(Ordering::SeqCst) {
+    if !OWNED_LIFECYCLE.load(Ordering::Acquire) && EJECT_REQUESTED.load(Ordering::SeqCst) {
         perform_eject();
     }
     result
@@ -118,6 +122,9 @@ unsafe extern "system" fn dx9_reset_impl(
     let Trampolines { dx9_reset, .. } =
         TRAMPOLINES.get().expect("DirectX 9 trampolines uninitialized");
 
+    if STOPPING.load(Ordering::Acquire) {
+        return dx9_reset(this, present_params);
+    }
     trace!("Resetting pipeline");
     if let Some(pipeline) = PIPELINE.take() {
         let render_loop = pipeline.into_inner().take();
@@ -197,6 +204,8 @@ impl ImguiDx9Hooks {
     where
         T: ImguiRenderLoop + Send + Sync + 'static,
     {
+        STOPPING.store(false, Ordering::Release);
+        OWNED_LIFECYCLE.store(false, Ordering::Release);
         let (dx9_present_addr, dx9_reset_addr) = get_target_addrs();
 
         trace!("IDirect3DDevice9::Present = {:p}", dx9_present_addr as *const c_void);
@@ -227,6 +236,43 @@ impl Hooks for ImguiDx9Hooks {
 
     fn hooks(&self) -> &[MhHook] {
         &self.0
+    }
+
+    fn use_owned_lifecycle(&mut self) {
+        OWNED_LIFECYCLE.store(true, Ordering::Release);
+    }
+
+    fn begin_shutdown(&mut self) {
+        STOPPING.store(true, Ordering::Release);
+    }
+
+    fn detach_window_procedures(&mut self) -> Result<()> {
+        if let Some(pipeline) = unsafe { PIPELINE.get() } {
+            let Some(mut pipeline) = pipeline.try_lock() else {
+                return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+            };
+            pipeline.detach_window_procedure()?;
+        }
+        Ok(())
+    }
+
+    unsafe fn release_render_resources(&mut self) -> Result<()> {
+        if !STOPPING.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+        }
+        if let Some(pipeline) = PIPELINE.take() {
+            match pipeline.into_inner().take_resident() {
+                Ok(render_loop) => drop(render_loop),
+                Err((error, pipeline)) => {
+                    let _ = PIPELINE.set(Mutex::new(pipeline));
+                    return Err(error);
+                },
+            }
+        }
+        RENDER_LOOP.take();
+        // Keep TRAMPOLINES and MinHook records: a caller may have cached a
+        // detour address before we disabled the hook, but entered it later.
+        Ok(())
     }
 
     unsafe fn unhook(&mut self) {

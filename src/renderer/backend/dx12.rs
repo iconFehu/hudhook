@@ -4,7 +4,7 @@ use std::ffi::c_void;
 use std::mem::{offset_of, ManuallyDrop};
 use std::{mem, ptr, slice};
 
-use imgui::internal::{RawCast, RawWrapper};
+use imgui::internal::RawWrapper;
 use imgui::{sys, BackendFlags, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
 use tracing::error;
 use windows::core::{s, w, Error, Interface, Result, HRESULT};
@@ -136,8 +136,8 @@ impl D3D12RenderEngine {
         let fence = Fence::new(&device)?;
 
         ctx.set_ini_filename(None);
-        ctx.io_mut().backend_flags |= BackendFlags::RENDERER_HAS_VTX_OFFSET
-            | BackendFlags::RENDERER_HAS_TEXTURES;
+        ctx.io_mut().backend_flags |=
+            BackendFlags::RENDERER_HAS_VTX_OFFSET | BackendFlags::RENDERER_HAS_TEXTURES;
         ctx.set_renderer_name(String::from(concat!("hudhook-dx12@", env!("CARGO_PKG_VERSION"))));
 
         Ok(Self {
@@ -239,13 +239,14 @@ impl RenderEngine for D3D12RenderEngine {
     }
 
     fn setup_fonts(&mut self, ctx: &mut Context) -> Result<()> {
-        // With Dear ImGui 1.92+ dynamic textures (BackendFlags::RENDERER_HAS_TEXTURES),
-        // the font atlas is built on-demand through ImTextureData system.
-        // We only need to set up the TexData pointer and initial status.
+        // With Dear ImGui 1.92+ dynamic textures
+        // (BackendFlags::RENDERER_HAS_TEXTURES), the font atlas is
+        // built on-demand through ImTextureData system. We only need to
+        // set up the TexData pointer and initial status.
         let fonts = ctx.fonts();
         let fonts_raw = fonts as *const _ as *mut sys::ImFontAtlas;
         let tex_data = unsafe { (*fonts_raw).TexData };
-        
+
         // ImGui will request texture creation via ImTextureStatus_WantCreate
         // in update_textures() when the atlas is actually needed
         if !tex_data.is_null() {
@@ -254,7 +255,7 @@ impl RenderEngine for D3D12RenderEngine {
                 sys::ImTextureData_SetStatus(tex_data, sys::ImTextureStatus_WantCreate);
             }
         }
-        
+
         Ok(())
     }
 
@@ -297,26 +298,15 @@ impl RenderEngine for D3D12RenderEngine {
                 }
 
                 let pitch = sys::ImTextureData_GetPitch(tex_ptr) as usize;
-                let data = std::slice::from_raw_parts(
-                    tex.Pixels as *const u8,
-                    pitch * height as usize,
-                );
+                let data =
+                    std::slice::from_raw_parts(tex.Pixels as *const u8, pitch * height as usize);
                 let bpp = tex.BytesPerPixel as usize;
                 let is_invalid = tex.TexID == 0;
 
                 if status == sys::ImTextureStatus_WantCreate || is_invalid {
                     let texture_id = self.texture_heap.create_texture(width, height)?;
                     self.texture_heap.upload_texture_region(
-                        texture_id,
-                        data,
-                        width,
-                        height,
-                        pitch,
-                        0,
-                        0,
-                        width,
-                        height,
-                        bpp,
+                        texture_id, data, width, height, pitch, 0, 0, width, height, bpp,
                     )?;
                     sys::ImTextureData_SetTexID(tex_ptr, texture_id.id() as sys::ImTextureID);
                     sys::ImTextureData_SetStatus(tex_ptr, sys::ImTextureStatus_OK);
@@ -326,10 +316,8 @@ impl RenderEngine for D3D12RenderEngine {
                 if status == sys::ImTextureStatus_WantUpdates {
                     let texture_id = TextureId::from(tex.TexID as usize);
                     if tex.Updates.Size > 0 && !tex.Updates.Data.is_null() {
-                        let rects = std::slice::from_raw_parts(
-                            tex.Updates.Data,
-                            tex.Updates.Size as usize,
-                        );
+                        let rects =
+                            std::slice::from_raw_parts(tex.Updates.Data, tex.Updates.Size as usize);
                         for rect in rects {
                             let x = rect.x as u32;
                             let y = rect.y as u32;
@@ -339,16 +327,7 @@ impl RenderEngine for D3D12RenderEngine {
                                 continue;
                             }
                             self.texture_heap.upload_texture_region(
-                                texture_id,
-                                data,
-                                width,
-                                height,
-                                pitch,
-                                x,
-                                y,
-                                w,
-                                h,
-                                bpp,
+                                texture_id, data, width, height, pitch, x, y, w, h, bpp,
                             )?;
                         }
                     } else if tex.UpdateRect.w != 0 && tex.UpdateRect.h != 0 {
@@ -357,29 +336,11 @@ impl RenderEngine for D3D12RenderEngine {
                         let w = tex.UpdateRect.w as u32;
                         let h = tex.UpdateRect.h as u32;
                         self.texture_heap.upload_texture_region(
-                            texture_id,
-                            data,
-                            width,
-                            height,
-                            pitch,
-                            x,
-                            y,
-                            w,
-                            h,
-                            bpp,
+                            texture_id, data, width, height, pitch, x, y, w, h, bpp,
                         )?;
                     } else {
                         self.texture_heap.upload_texture_region(
-                            texture_id,
-                            data,
-                            width,
-                            height,
-                            pitch,
-                            0,
-                            0,
-                            width,
-                            height,
-                            bpp,
+                            texture_id, data, width, height, pitch, 0, 0, width, height, bpp,
                         )?;
                     }
 
@@ -1113,16 +1074,7 @@ impl TextureHeap {
     ) -> Result<()> {
         let src_pitch = (width as usize) * 4;
         self.upload_texture_region(
-            texture_id,
-            data,
-            width,
-            height,
-            src_pitch,
-            0,
-            0,
-            width,
-            height,
-            4,
+            texture_id, data, width, height, src_pitch, 0, 0, width, height, 4,
         )
     }
 

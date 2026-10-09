@@ -61,8 +61,8 @@ impl D3D9RenderEngine {
         let projection_buffer = Default::default();
 
         ctx.set_ini_filename(None);
-        ctx.io_mut().backend_flags |= BackendFlags::RENDERER_HAS_VTX_OFFSET
-            | BackendFlags::RENDERER_HAS_TEXTURES;
+        ctx.io_mut().backend_flags |=
+            BackendFlags::RENDERER_HAS_VTX_OFFSET | BackendFlags::RENDERER_HAS_TEXTURES;
         ctx.set_renderer_name(String::from(concat!("hudhook-dx9@", env!("CARGO_PKG_VERSION"))));
 
         Ok(Self { device, texture_heap, vertex_buffer, index_buffer, projection_buffer })
@@ -107,13 +107,14 @@ impl RenderEngine for D3D9RenderEngine {
     }
 
     fn setup_fonts(&mut self, ctx: &mut Context) -> Result<()> {
-        // With Dear ImGui 1.92+ dynamic textures (BackendFlags::RENDERER_HAS_TEXTURES),
-        // the font atlas is built on-demand through ImTextureData system.
-        // We only need to set up the TexData pointer and initial status.
+        // With Dear ImGui 1.92+ dynamic textures
+        // (BackendFlags::RENDERER_HAS_TEXTURES), the font atlas is
+        // built on-demand through ImTextureData system. We only need to
+        // set up the TexData pointer and initial status.
         let fonts = ctx.fonts();
         let fonts_raw = fonts as *const _ as *mut sys::ImFontAtlas;
         let tex_data = unsafe { (*fonts_raw).TexData };
-        
+
         // ImGui will request texture creation via ImTextureStatus_WantCreate
         // in update_textures() when the atlas is actually needed
         if !tex_data.is_null() {
@@ -122,7 +123,7 @@ impl RenderEngine for D3D9RenderEngine {
                 sys::ImTextureData_SetStatus(tex_data, sys::ImTextureStatus_WantCreate);
             }
         }
-        
+
         Ok(())
     }
 
@@ -165,26 +166,15 @@ impl RenderEngine for D3D9RenderEngine {
                 }
 
                 let pitch = sys::ImTextureData_GetPitch(tex_ptr) as usize;
-                let data = std::slice::from_raw_parts(
-                    tex.Pixels as *const u8,
-                    pitch * height as usize,
-                );
+                let data =
+                    std::slice::from_raw_parts(tex.Pixels as *const u8, pitch * height as usize);
                 let bpp = tex.BytesPerPixel as usize;
                 let is_invalid = tex.TexID == 0;
 
                 if status == sys::ImTextureStatus_WantCreate || is_invalid {
                     let texture_id = self.texture_heap.create_texture(width, height)?;
                     self.texture_heap.upload_texture_region(
-                        texture_id,
-                        data,
-                        width,
-                        height,
-                        pitch,
-                        0,
-                        0,
-                        width,
-                        height,
-                        bpp,
+                        texture_id, data, width, height, pitch, 0, 0, width, height, bpp,
                     )?;
                     sys::ImTextureData_SetTexID(tex_ptr, texture_id.id() as sys::ImTextureID);
                     sys::ImTextureData_SetStatus(tex_ptr, sys::ImTextureStatus_OK);
@@ -194,10 +184,8 @@ impl RenderEngine for D3D9RenderEngine {
                 if status == sys::ImTextureStatus_WantUpdates {
                     let texture_id = TextureId::from(tex.TexID as usize);
                     if tex.Updates.Size > 0 && !tex.Updates.Data.is_null() {
-                        let rects = std::slice::from_raw_parts(
-                            tex.Updates.Data,
-                            tex.Updates.Size as usize,
-                        );
+                        let rects =
+                            std::slice::from_raw_parts(tex.Updates.Data, tex.Updates.Size as usize);
                         for rect in rects {
                             let x = rect.x as u32;
                             let y = rect.y as u32;
@@ -207,16 +195,7 @@ impl RenderEngine for D3D9RenderEngine {
                                 continue;
                             }
                             self.texture_heap.upload_texture_region(
-                                texture_id,
-                                data,
-                                width,
-                                height,
-                                pitch,
-                                x,
-                                y,
-                                w,
-                                h,
-                                bpp,
+                                texture_id, data, width, height, pitch, x, y, w, h, bpp,
                             )?;
                         }
                     } else if tex.UpdateRect.w != 0 && tex.UpdateRect.h != 0 {
@@ -225,29 +204,11 @@ impl RenderEngine for D3D9RenderEngine {
                         let w = tex.UpdateRect.w as u32;
                         let h = tex.UpdateRect.h as u32;
                         self.texture_heap.upload_texture_region(
-                            texture_id,
-                            data,
-                            width,
-                            height,
-                            pitch,
-                            x,
-                            y,
-                            w,
-                            h,
-                            bpp,
+                            texture_id, data, width, height, pitch, x, y, w, h, bpp,
                         )?;
                     } else {
                         self.texture_heap.upload_texture_region(
-                            texture_id,
-                            data,
-                            width,
-                            height,
-                            pitch,
-                            0,
-                            0,
-                            width,
-                            height,
-                            bpp,
+                            texture_id, data, width, height, pitch, 0, 0, width, height, bpp,
                         )?;
                     }
 
@@ -562,16 +523,7 @@ impl TextureHeap {
     ) -> Result<()> {
         let src_pitch = (width as usize) * 4;
         self.upload_texture_region(
-            texture_id,
-            data,
-            width,
-            height,
-            src_pitch,
-            0,
-            0,
-            width,
-            height,
-            4,
+            texture_id, data, width, height, src_pitch, 0, 0, width, height, 4,
         )
     }
 
@@ -598,12 +550,8 @@ impl TextureHeap {
         }
 
         let mut r: D3DLOCKED_RECT = Default::default();
-        let rect = RECT {
-            left: x as i32,
-            top: y as i32,
-            right: (x + w) as i32,
-            bottom: (y + h) as i32,
-        };
+        let rect =
+            RECT { left: x as i32, top: y as i32, right: (x + w) as i32, bottom: (y + h) as i32 };
         texture.resource.LockRect(0, &mut r, &rect, 0)?;
 
         let bits = r.pBits as *mut u8;

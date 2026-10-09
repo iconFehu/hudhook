@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::mem::offset_of;
 use std::{mem, ptr, slice};
 
-use imgui::internal::{RawCast, RawWrapper};
+use imgui::internal::RawWrapper;
 use imgui::{sys, BackendFlags, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
 use tracing::error;
 use windows::core::{s, Error, Result, HRESULT};
@@ -40,8 +40,8 @@ impl D3D11RenderEngine {
         let texture_heap = TextureHeap::new(&device, &device_context)?;
 
         ctx.set_ini_filename(None);
-        ctx.io_mut().backend_flags |= BackendFlags::RENDERER_HAS_VTX_OFFSET
-            | BackendFlags::RENDERER_HAS_TEXTURES;
+        ctx.io_mut().backend_flags |=
+            BackendFlags::RENDERER_HAS_VTX_OFFSET | BackendFlags::RENDERER_HAS_TEXTURES;
         ctx.set_renderer_name(String::from(concat!("hudhook-dx11@", env!("CARGO_PKG_VERSION"))));
 
         Ok(Self {
@@ -141,13 +141,14 @@ impl RenderEngine for D3D11RenderEngine {
     }
 
     fn setup_fonts(&mut self, ctx: &mut Context) -> Result<()> {
-        // With Dear ImGui 1.92+ dynamic textures (BackendFlags::RENDERER_HAS_TEXTURES),
-        // the font atlas is built on-demand through ImTextureData system.
-        // We only need to set up the TexData pointer and initial status.
+        // With Dear ImGui 1.92+ dynamic textures
+        // (BackendFlags::RENDERER_HAS_TEXTURES), the font atlas is
+        // built on-demand through ImTextureData system. We only need to
+        // set up the TexData pointer and initial status.
         let fonts = ctx.fonts();
         let fonts_raw = fonts as *const _ as *mut sys::ImFontAtlas;
         let tex_data = unsafe { (*fonts_raw).TexData };
-        
+
         // ImGui will request texture creation via ImTextureStatus_WantCreate
         // in update_textures() when the atlas is actually needed
         if !tex_data.is_null() {
@@ -156,7 +157,7 @@ impl RenderEngine for D3D11RenderEngine {
                 sys::ImTextureData_SetStatus(tex_data, sys::ImTextureStatus_WantCreate);
             }
         }
-        
+
         Ok(())
     }
 
@@ -199,15 +200,13 @@ impl RenderEngine for D3D11RenderEngine {
                 }
 
                 let pitch = sys::ImTextureData_GetPitch(tex_ptr) as usize;
-                let data = std::slice::from_raw_parts(
-                    tex.Pixels as *const u8,
-                    pitch * height as usize,
-                );
+                let data =
+                    std::slice::from_raw_parts(tex.Pixels as *const u8, pitch * height as usize);
                 let bpp = tex.BytesPerPixel as usize;
                 let is_invalid = tex.TexID == 0;
 
                 if status == sys::ImTextureStatus_WantCreate || is_invalid {
-                    let mut upload_storage = Vec::new();
+                    let mut upload_storage;
                     let upload_data = if bpp == 1 || pitch != (width as usize * bpp) {
                         upload_storage = Vec::with_capacity(width as usize * height as usize * 4);
                         for row in 0..height as usize {
@@ -218,9 +217,8 @@ impl RenderEngine for D3D11RenderEngine {
                                     let a = data[src_offset];
                                     upload_storage.extend_from_slice(&[255, 255, 255, a]);
                                 } else {
-                                    upload_storage.extend_from_slice(
-                                        &data[src_offset..(src_offset + 4)],
-                                    );
+                                    upload_storage
+                                        .extend_from_slice(&data[src_offset..(src_offset + 4)]);
                                 }
                             }
                         }
@@ -229,7 +227,8 @@ impl RenderEngine for D3D11RenderEngine {
                         data
                     };
 
-                    let texture_id = self.texture_heap.create_texture(upload_data, width, height)?;
+                    let texture_id =
+                        self.texture_heap.create_texture(upload_data, width, height)?;
                     sys::ImTextureData_SetTexID(tex_ptr, texture_id.id() as sys::ImTextureID);
                     sys::ImTextureData_SetStatus(tex_ptr, sys::ImTextureStatus_OK);
                     continue;
@@ -238,10 +237,8 @@ impl RenderEngine for D3D11RenderEngine {
                 if status == sys::ImTextureStatus_WantUpdates {
                     let texture_id = TextureId::from(tex.TexID as usize);
                     if tex.Updates.Size > 0 && !tex.Updates.Data.is_null() {
-                        let rects = std::slice::from_raw_parts(
-                            tex.Updates.Data,
-                            tex.Updates.Size as usize,
-                        );
+                        let rects =
+                            std::slice::from_raw_parts(tex.Updates.Data, tex.Updates.Size as usize);
                         for rect in rects {
                             let x = rect.x as u32;
                             let y = rect.y as u32;
@@ -251,16 +248,7 @@ impl RenderEngine for D3D11RenderEngine {
                                 continue;
                             }
                             self.texture_heap.update_texture_region(
-                                texture_id,
-                                data,
-                                width,
-                                height,
-                                pitch,
-                                x,
-                                y,
-                                w,
-                                h,
-                                bpp,
+                                texture_id, data, width, height, pitch, x, y, w, h, bpp,
                             )?;
                         }
                     } else if tex.UpdateRect.w != 0 && tex.UpdateRect.h != 0 {
@@ -269,29 +257,11 @@ impl RenderEngine for D3D11RenderEngine {
                         let w = tex.UpdateRect.w as u32;
                         let h = tex.UpdateRect.h as u32;
                         self.texture_heap.update_texture_region(
-                            texture_id,
-                            data,
-                            width,
-                            height,
-                            pitch,
-                            x,
-                            y,
-                            w,
-                            h,
-                            bpp,
+                            texture_id, data, width, height, pitch, x, y, w, h, bpp,
                         )?;
                     } else {
                         self.texture_heap.update_texture_region(
-                            texture_id,
-                            data,
-                            width,
-                            height,
-                            pitch,
-                            0,
-                            0,
-                            width,
-                            height,
-                            bpp,
+                            texture_id, data, width, height, pitch, 0, 0, width, height, bpp,
                         )?;
                     }
 
@@ -845,16 +815,7 @@ impl TextureHeap {
     ) -> Result<()> {
         let src_pitch = (width as usize) * 4;
         self.update_texture_region(
-            texture_id,
-            data,
-            width,
-            height,
-            src_pitch,
-            0,
-            0,
-            width,
-            height,
-            4,
+            texture_id, data, width, height, src_pitch, 0, 0, width, height, 4,
         )
     }
 
@@ -882,7 +843,7 @@ impl TextureHeap {
 
         let src_offset = (y as usize * src_pitch) + (x as usize * bpp);
         let src_ptr = data.as_ptr().add(src_offset);
-        let mut upload_storage = Vec::new();
+        let mut upload_storage;
         let (upload_ptr, upload_pitch) = if bpp == 1 {
             upload_storage = Vec::with_capacity(w as usize * h as usize * 4);
             for row in 0..h as usize {
@@ -898,14 +859,7 @@ impl TextureHeap {
             (src_ptr, src_pitch as u32)
         };
 
-        let region = D3D11_BOX {
-            left: x,
-            top: y,
-            front: 0,
-            right: x + w,
-            bottom: y + h,
-            back: 1,
-        };
+        let region = D3D11_BOX { left: x, top: y, front: 0, right: x + w, bottom: y + h, back: 1 };
 
         self.device_context.UpdateSubresource(
             &texture.resource,

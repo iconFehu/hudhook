@@ -187,13 +187,14 @@ impl ImguiRenderLoop for HookExample {
                 ui.text("Hello world!");
                 ui.text("こんにちは世界！");
                 ui.text("This...is...imgui-rs!");
-                
+
                 // Display keyboard state using new API
                 ui.text("Keyboard state (showing first 128 key codes):");
                 for y in 0..8 {
                     for x in 0..16 {
                         let key_idx = y * 16 + x;
-                        // Access raw KeysData through sys API for display purposes
+                        // Access raw KeysData through sys API for display
+                        // purposes
                         let io_ptr = ui.io() as *const _ as *const imgui::sys::ImGuiIO;
                         let is_down = unsafe {
                             if key_idx < 155 {
@@ -204,11 +205,7 @@ impl ImguiRenderLoop for HookExample {
                         };
                         let _token = ui.push_style_color(
                             StyleColor::Text,
-                            if is_down {
-                                [0., 1., 0., 1.]
-                            } else {
-                                [1., 1., 1., 1.]
-                            },
+                            if is_down { [0., 1., 0., 1.] } else { [1., 1., 1., 1.] },
                         );
                         ui.text(format!("{key_idx:02x}"));
                         ui.same_line();

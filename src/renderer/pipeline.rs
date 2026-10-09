@@ -10,7 +10,9 @@ use once_cell::sync::Lazy;
 use parking_lot::Mutex;
 use tracing::{error, warn};
 use windows::core::{Error, Result, HRESULT};
-use windows::Win32::Foundation::{GetLastError, SetLastError, HWND, LPARAM, LRESULT, WPARAM, WIN32_ERROR};
+use windows::Win32::Foundation::{
+    GetLastError, SetLastError, HWND, LPARAM, LRESULT, WIN32_ERROR, WPARAM,
+};
 use windows::Win32::UI::WindowsAndMessaging::{
     CallWindowProcW, DefWindowProcW, GetWindowLongPtrW, IsWindow, SetWindowLongPtrW, GWLP_WNDPROC,
 };
@@ -225,7 +227,7 @@ fn restore_window_procedure(hwnd: HWND, original: WndProcType) -> Result<()> {
         if current == original as usize {
             return Ok(());
         }
-        if current != pipeline_wnd_proc as usize {
+        if current != pipeline_wnd_proc as *const () as usize {
             // A later subclass may still call through us. Overwriting it
             // would break its chain and would not make DLL unloading safe.
             return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
@@ -235,7 +237,7 @@ fn restore_window_procedure(hwnd: HWND, original: WndProcType) -> Result<()> {
         if previous == 0 && GetLastError().0 != 0 {
             return Err(Error::from_thread());
         }
-        if previous as usize != pipeline_wnd_proc as usize {
+        if previous as usize != pipeline_wnd_proc as *const () as usize {
             // Another subclass arrived between the read and restore.
             // Put its procedure back and retain our forwarding state.
             SetWindowLongPtrW(hwnd, GWLP_WNDPROC, previous);
@@ -284,9 +286,8 @@ unsafe extern "system" fn pipeline_wnd_proc(
 
 #[cfg(test)]
 mod tests {
-    use crate::hooks::DummyHwnd;
-
     use super::*;
+    use crate::hooks::DummyHwnd;
 
     #[test]
     fn window_procedure_detach_preserves_later_subclasses() {
@@ -305,20 +306,21 @@ mod tests {
         let window = DummyHwnd::new();
         let hwnd = window.hwnd();
         assert!(unsafe { IsWindow(Some(hwnd)) }.as_bool());
-        let original: WndProcType = unsafe {
-            mem::transmute(GetWindowLongPtrW(hwnd, GWLP_WNDPROC))
-        };
+        let original: WndProcType =
+            unsafe { mem::transmute(GetWindowLongPtrW(hwnd, GWLP_WNDPROC)) };
 
-        unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, pipeline_wnd_proc as usize as _) };
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_WNDPROC, pipeline_wnd_proc as *const () as usize as _)
+        };
         assert!(restore_window_procedure(hwnd, original).is_ok());
         assert_eq!(unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) } as usize, original as usize);
         assert!(restore_window_procedure(hwnd, original).is_ok());
 
-        unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, later_subclass as usize as _) };
+        unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, later_subclass as *const () as usize as _) };
         assert!(restore_window_procedure(hwnd, original).is_err());
         assert_eq!(
             unsafe { GetWindowLongPtrW(hwnd, GWLP_WNDPROC) } as usize,
-            later_subclass as usize,
+            later_subclass as *const () as usize,
         );
         unsafe { SetWindowLongPtrW(hwnd, GWLP_WNDPROC, original as usize as _) };
     }

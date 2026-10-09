@@ -2,7 +2,7 @@
 
 use std::ffi::{c_void, CString};
 use std::mem;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use imgui::Context;
@@ -26,6 +26,8 @@ struct Trampolines {
 static mut TRAMPOLINES: OnceLock<Trampolines> = OnceLock::new();
 static mut PIPELINE: OnceCell<Mutex<Pipeline<OpenGl3RenderEngine>>> = OnceCell::new();
 static mut RENDER_LOOP: OnceCell<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceCell::new();
+static STOPPING: AtomicBool = AtomicBool::new(false);
+static OWNED_LIFECYCLE: AtomicBool = AtomicBool::new(false);
 
 unsafe fn init_pipeline(dc: HDC) -> Result<Mutex<Pipeline<OpenGl3RenderEngine>>> {
     let hwnd = WindowFromDC(dc);
@@ -69,13 +71,15 @@ unsafe extern "system" fn opengl32_wgl_swap_buffers_impl(dc: HDC) {
     let Trampolines { opengl32_wgl_swap_buffers } =
         TRAMPOLINES.get().expect("OpenGL3 trampolines uninitialized");
 
-    if let Err(e) = render(dc) {
-        error!("Render error: {e:?}");
+    if !STOPPING.load(Ordering::Acquire) {
+        if let Err(e) = render(dc) {
+            error!("Render error: {e:?}");
+        }
     }
 
     trace!("Call OpenGL3 wglSwapBuffers trampoline");
     opengl32_wgl_swap_buffers(dc);
-    if EJECT_REQUESTED.load(Ordering::SeqCst) {
+    if !OWNED_LIFECYCLE.load(Ordering::Acquire) && EJECT_REQUESTED.load(Ordering::SeqCst) {
         perform_eject();
     }
 }
@@ -114,6 +118,8 @@ impl ImguiOpenGl3Hooks {
     where
         T: ImguiRenderLoop + Send + Sync + 'static,
     {
+        STOPPING.store(false, Ordering::Release);
+        OWNED_LIFECYCLE.store(false, Ordering::Release);
         // Grab the addresses
         let hook_opengl_swap_buffers_address = get_opengl_wglswapbuffers_addr();
 
@@ -147,6 +153,43 @@ impl Hooks for ImguiOpenGl3Hooks {
 
     fn hooks(&self) -> &[MhHook] {
         &self.0
+    }
+
+    fn use_owned_lifecycle(&mut self) {
+        OWNED_LIFECYCLE.store(true, Ordering::Release);
+    }
+
+    fn begin_shutdown(&mut self) {
+        STOPPING.store(true, Ordering::Release);
+    }
+
+    fn detach_window_procedures(&mut self) -> Result<()> {
+        if let Some(pipeline) = unsafe { PIPELINE.get() } {
+            let Some(mut pipeline) = pipeline.try_lock() else {
+                return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+            };
+            pipeline.detach_window_procedure()?;
+        }
+        Ok(())
+    }
+
+    unsafe fn release_render_resources(&mut self) -> Result<()> {
+        if !STOPPING.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+        }
+        if let Some(pipeline) = PIPELINE.take() {
+            match pipeline.into_inner().take_resident() {
+                Ok(render_loop) => drop(render_loop),
+                Err((error, pipeline)) => {
+                    let _ = PIPELINE.set(Mutex::new(pipeline));
+                    return Err(error);
+                },
+            }
+        }
+        RENDER_LOOP.take();
+        // Keep TRAMPOLINES and MinHook records: a caller may have cached a
+        // detour address before we disabled the hook, but entered it later.
+        Ok(())
     }
 
     unsafe fn unhook(&mut self) {

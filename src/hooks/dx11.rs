@@ -2,7 +2,7 @@
 
 use std::ffi::c_void;
 use std::mem;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use imgui::Context;
@@ -52,6 +52,8 @@ struct Trampolines {
 static mut TRAMPOLINES: OnceLock<Trampolines> = OnceLock::new();
 static mut PIPELINE: OnceCell<Mutex<Pipeline<D3D11RenderEngine>>> = OnceCell::new();
 static mut RENDER_LOOP: OnceCell<Box<dyn ImguiRenderLoop + Send + Sync>> = OnceCell::new();
+static STOPPING: AtomicBool = AtomicBool::new(false);
+static OWNED_LIFECYCLE: AtomicBool = AtomicBool::new(false);
 
 unsafe fn init_pipeline(swap_chain: &IDXGISwapChain) -> Result<Mutex<Pipeline<D3D11RenderEngine>>> {
     let desc = swap_chain.GetDesc()?;
@@ -106,13 +108,15 @@ unsafe extern "system" fn dxgi_swap_chain_present_impl(
     let Trampolines { dxgi_swap_chain_present, .. } =
         TRAMPOLINES.get().expect("DirectX 11 trampolines uninitialized");
 
-    if let Err(e) = render(&swap_chain) {
-        error!("Render error: {e:?}");
+    if !STOPPING.load(Ordering::Acquire) {
+        if let Err(e) = render(&swap_chain) {
+            error!("Render error: {e:?}");
+        }
     }
 
     trace!("Call IDXGISwapChain::Present trampoline");
     let result = dxgi_swap_chain_present(swap_chain, sync_interval, flags);
-    if EJECT_REQUESTED.load(Ordering::SeqCst) {
+    if !OWNED_LIFECYCLE.load(Ordering::Acquire) && EJECT_REQUESTED.load(Ordering::SeqCst) {
         perform_eject();
     }
     result
@@ -130,6 +134,18 @@ unsafe extern "system" fn dxgi_swap_chain_resize_buffers_impl(
 
     let Trampolines { dxgi_swap_chain_resize_buffers, .. } =
         TRAMPOLINES.get().expect("DirectX 11 trampolines uninitialized");
+
+    if STOPPING.load(Ordering::Acquire) {
+        trace!("Call IDXGISwapChain::ResizeBuffers trampoline (stopping)");
+        return dxgi_swap_chain_resize_buffers(
+            swap_chain,
+            buffer_count,
+            width,
+            height,
+            new_format,
+            flags,
+        );
+    }
 
     trace!("Call IDXGISwapChain::ResizeBuffers trampoline");
     let result =
@@ -219,6 +235,8 @@ impl ImguiDx11Hooks {
     where
         T: ImguiRenderLoop + Send + Sync + 'static,
     {
+        STOPPING.store(false, Ordering::Release);
+        OWNED_LIFECYCLE.store(false, Ordering::Release);
         let (dxgi_swap_chain_present_addr, dxgi_swap_chain_resize_buffers_addr) =
             get_target_addrs();
 
@@ -265,6 +283,43 @@ impl Hooks for ImguiDx11Hooks {
 
     fn hooks(&self) -> &[MhHook] {
         &self.0
+    }
+
+    fn use_owned_lifecycle(&mut self) {
+        OWNED_LIFECYCLE.store(true, Ordering::Release);
+    }
+
+    fn begin_shutdown(&mut self) {
+        STOPPING.store(true, Ordering::Release);
+    }
+
+    fn detach_window_procedures(&mut self) -> Result<()> {
+        if let Some(pipeline) = unsafe { PIPELINE.get() } {
+            let Some(mut pipeline) = pipeline.try_lock() else {
+                return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+            };
+            pipeline.detach_window_procedure()?;
+        }
+        Ok(())
+    }
+
+    unsafe fn release_render_resources(&mut self) -> Result<()> {
+        if !STOPPING.load(Ordering::Acquire) {
+            return Err(Error::from_hresult(HRESULT(0x80004005u32 as i32)));
+        }
+        if let Some(pipeline) = PIPELINE.take() {
+            match pipeline.into_inner().take_resident() {
+                Ok(render_loop) => drop(render_loop),
+                Err((error, pipeline)) => {
+                    let _ = PIPELINE.set(Mutex::new(pipeline));
+                    return Err(error);
+                },
+            }
+        }
+        RENDER_LOOP.take();
+        // Keep TRAMPOLINES and MinHook records: a caller may have cached a
+        // detour address before we disabled the hook, but entered it later.
+        Ok(())
     }
 
     unsafe fn unhook(&mut self) {

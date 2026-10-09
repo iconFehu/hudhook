@@ -1,11 +1,10 @@
 //! Implementations of render engine hooks.
 
 use std::mem;
-use std::sync::OnceLock;
 
 use tracing::{debug, error};
-use windows::core::w;
-use windows::Win32::Foundation::{BOOL, HWND, LPARAM, LRESULT, WPARAM};
+use windows::core::{w, BOOL};
+use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::GetCurrentProcessId;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -26,26 +25,25 @@ pub mod opengl3;
 /// A utility function to retrieve the top level [`HWND`] belonging to this
 /// process.
 pub fn find_process_hwnd() -> Option<HWND> {
-    static mut FOUND_HWND: OnceLock<HWND> = OnceLock::new();
-
-    unsafe extern "system" fn enum_callback(hwnd: HWND, _: LPARAM) -> BOOL {
+    unsafe extern "system" fn enum_callback(hwnd: HWND, lparam: LPARAM) -> BOOL {
         let mut pid = 0;
         GetWindowThreadProcessId(hwnd, Some(&mut pid));
         tracing::debug!("hwnd {hwnd:?} has pid {pid} vs {}", GetCurrentProcessId());
         if pid == GetCurrentProcessId() {
-            FOUND_HWND.get_or_init(|| hwnd);
+            *(lparam.0 as *mut Option<HWND>) = Some(hwnd);
             BOOL::from(false)
         } else {
             BOOL::from(true)
         }
     }
 
+    let mut found_hwnd: Option<HWND> = None;
+
     unsafe {
-        FOUND_HWND.take();
-        EnumWindows(Some(enum_callback), LPARAM(0)).ok();
+        EnumWindows(Some(enum_callback), LPARAM(&mut found_hwnd as *mut _ as isize)).ok();
     }
 
-    unsafe { FOUND_HWND.get().copied() }
+    found_hwnd
 }
 
 /// A RAII dummy window.
@@ -100,10 +98,11 @@ impl DummyHwnd {
                 100,
                 None,
                 None,
-                wndclass.hInstance,
+                Some(wndclass.hInstance),
                 None,
             )
         };
+        let hwnd = hwnd.expect("CreateWindowExW");
         debug!("{:?}", hwnd);
 
         Self(hwnd, wndclass)
@@ -122,7 +121,7 @@ impl Drop for DummyHwnd {
             if let Err(e) = DestroyWindow(self.0) {
                 error!("DestroyWindow: {e}");
             }
-            if let Err(e) = UnregisterClassW(self.1.lpszClassName, self.1.hInstance) {
+            if let Err(e) = UnregisterClassW(self.1.lpszClassName, Some(self.1.hInstance)) {
                 error!("UnregisterClass: {e}");
             }
         }

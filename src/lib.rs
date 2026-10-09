@@ -117,9 +117,12 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 
+pub use imgui;
 use imgui::{Context, Io, TextureId, Ui};
 use once_cell::sync::OnceCell;
+pub use tracing;
 use tracing::{error, trace, warn};
+pub use windows;
 use windows::core::Error;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, WPARAM};
 use windows::Win32::System::Console::{
@@ -127,7 +130,6 @@ use windows::Win32::System::Console::{
     ENABLE_VIRTUAL_TERMINAL_PROCESSING, STD_OUTPUT_HANDLE,
 };
 use windows::Win32::System::LibraryLoader::FreeLibraryAndExitThread;
-pub use {imgui, tracing, windows};
 
 use crate::mh::{MH_ApplyQueued, MH_Initialize, MH_Uninitialize, MhHook, MH_STATUS};
 use crate::util::HookEjectionBarrier;
@@ -167,6 +169,19 @@ pub trait RenderContext {
     ) -> Result<(), Error>;
 }
 
+/// Represents a control flow decision before the `wnd_proc` is executed.
+///
+/// See [`crate::ImguiRenderLoop::before_wnd_proc`].
+#[derive(PartialEq, Eq)]
+pub enum BeforeWndProc {
+    /// Execute the `wnd_proc` code, and then run
+    /// [`crate::ImguiRenderLoop::after_wnd_proc`].
+    Continue,
+    /// Skip the `wnd_proc` code, run
+    /// [`crate::ImguiRenderLoop::after_wnd_proc`].
+    Break,
+}
+
 /// Allocate a Windows console.
 pub fn alloc_console() -> Result<(), Error> {
     if !CONSOLE_ALLOCATED.swap(true, Ordering::SeqCst) {
@@ -187,8 +202,8 @@ pub fn enable_console_colors() {
             let mut current_console_mode = CONSOLE_MODE(0);
             GetConsoleMode(stdout_handle, &mut current_console_mode).unwrap();
 
-            // Set the new mode to include ENABLE_VIRTUAL_TERMINAL_PROCESSING for ANSI
-            // escape sequences
+            // Set the new mode to include ENABLE_VIRTUAL_TERMINAL_PROCESSING
+            // for ANSI escape sequences
             current_console_mode.0 |= ENABLE_VIRTUAL_TERMINAL_PROCESSING.0;
 
             // Call SetConsoleMode to set the new mode
@@ -244,7 +259,7 @@ unsafe fn perform_eject() {
         HOOK_EJECTION_BARRIER.wait_for_all_guards();
 
         if let Some(module) = MODULE.take() {
-            FreeLibraryAndExitThread(module, 0);
+            FreeLibraryAndExitThread(module.into(), 0);
         }
         trace!("Finished ejecting!");
     });
@@ -277,8 +292,19 @@ pub trait ImguiRenderLoop {
     /// Called every frame. Use the provided `ui` object to build your UI.
     fn render(&mut self, ui: &mut Ui);
 
-    /// Called during the window procedure.
-    fn on_wnd_proc(&self, _hwnd: HWND, _umsg: u32, _wparam: WPARAM, _lparam: LPARAM) {}
+    /// Called before the window procedure.
+    fn before_wnd_proc(
+        &self,
+        _hwnd: HWND,
+        _umsg: u32,
+        _wparam: WPARAM,
+        _lparam: LPARAM,
+    ) -> BeforeWndProc {
+        BeforeWndProc::Continue
+    }
+
+    /// Called after the window procedure.
+    fn after_wnd_proc(&self, _hwnd: HWND, _umsg: u32, _wparam: WPARAM, _lparam: LPARAM) {}
 
     /// Returns the types of window message that
     /// you do not want to propagate to the main window
@@ -391,7 +417,8 @@ impl Hudhook {
 /// Example usage:
 /// ```no_run
 /// use hudhook::hooks::dx12::ImguiDx12Hooks;
-/// use hudhook::hooks::ImguiRenderLoop;
+/// use hudhook::windows::Win32::Foundation::HINSTANCE;
+/// use hudhook::windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH;
 /// use hudhook::*;
 ///
 /// pub struct MyRenderLoop;
@@ -403,15 +430,17 @@ impl Hudhook {
 /// }
 ///
 /// #[no_mangle]
-/// pub unsafe extern "stdcall" fn DllMain(
+/// pub unsafe extern "system" fn DllMain(
 ///     hmodule: HINSTANCE,
 ///     reason: u32,
 ///     _: *mut std::ffi::c_void,
 /// ) {
 ///     if reason == DLL_PROCESS_ATTACH {
+///         let hmodule_raw = hmodule.0 as usize;
 ///         std::thread::spawn(move || {
+///             let hmodule = HINSTANCE(hmodule_raw as _);
 ///             let hooks = Hudhook::builder()
-///                 .with::<ImguiDx12Hooks>(MyRenderLoop())
+///                 .with::<ImguiDx12Hooks>(MyRenderLoop)
 ///                 .with_hmodule(hmodule)
 ///                 .build();
 ///             hooks.apply();
@@ -451,7 +480,6 @@ impl HudhookBuilder {
 /// Example usage:
 /// ```no_run
 /// use hudhook::hooks::dx12::ImguiDx12Hooks;
-/// use hudhook::hooks::ImguiRenderLoop;
 /// use hudhook::*;
 ///
 /// pub struct MyRenderLoop;
@@ -462,14 +490,14 @@ impl HudhookBuilder {
 ///     }
 /// }
 ///
-/// hudhook::hudhook!(MyRenderLoop.into_hook::<ImguiDx12Hooks>());
+/// hudhook::hudhook!(ImguiDx12Hooks, MyRenderLoop);
 /// ```
 #[macro_export]
 macro_rules! hudhook {
     ($t:ty, $hooks:expr) => {
         /// Entry point created by the `hudhook` library.
         #[no_mangle]
-        pub unsafe extern "stdcall" fn DllMain(
+        pub unsafe extern "system" fn DllMain(
             hmodule: ::hudhook::windows::Win32::Foundation::HINSTANCE,
             reason: u32,
             _: *mut ::std::ffi::c_void,
@@ -478,7 +506,10 @@ macro_rules! hudhook {
 
             if reason == ::hudhook::windows::Win32::System::SystemServices::DLL_PROCESS_ATTACH {
                 ::hudhook::tracing::trace!("DllMain()");
+                let hmodule_raw = hmodule.0 as usize;
                 ::std::thread::spawn(move || {
+                    let hmodule =
+                        ::hudhook::windows::Win32::Foundation::HINSTANCE(hmodule_raw as _);
                     if let Err(e) = ::hudhook::Hudhook::builder()
                         .with::<$t>({ $hooks })
                         .with_hmodule(hmodule)

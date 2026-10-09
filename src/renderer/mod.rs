@@ -22,6 +22,10 @@ pub(crate) trait RenderEngine: RenderContext {
     {
         update_textures(self, draw_data)
     }
+
+    fn wait_idle(&mut self) -> Result<()> {
+        Ok(())
+    }
 }
 
 fn update_textures(render_context: &mut dyn RenderContext, draw_data: &DrawData) -> Result<()> {

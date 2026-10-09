@@ -2,13 +2,13 @@
 
 use std::{mem, ptr};
 
-use imgui::internal::{RawCast, RawWrapper};
-use imgui::{sys, BackendFlags, Context, DrawCmd, DrawData, DrawIdx, TextureId};
+use imgui::internal::RawWrapper;
+use imgui::{BackendFlags, Context, DrawCmd, DrawData, DrawIdx, TextureId};
 use tracing::error;
 use windows::core::{Error, Result, HRESULT};
-use windows::Foundation::Numerics::Matrix4x4;
 use windows::Win32::Foundation::RECT;
 use windows::Win32::Graphics::Direct3D9::*;
+use windows_numerics::Matrix4x4;
 
 use crate::renderer::RenderEngine;
 use crate::{util, RenderContext};
@@ -261,6 +261,10 @@ impl RenderEngine for D3D9RenderEngine {
 
 impl D3D9RenderEngine {
     unsafe fn render_draw_data(&mut self, draw_data: &DrawData) -> Result<()> {
+        if draw_data.total_vtx_count == 0 {
+            return Ok(());
+        }
+
         self.vertex_buffer.clear();
         self.index_buffer.clear();
 
@@ -555,34 +559,6 @@ impl TextureHeap {
         width: u32,
         height: u32,
     ) -> Result<()> {
-        let src_pitch = (width as usize) * 4;
-        self.upload_texture_region(
-            texture_id,
-            data,
-            width,
-            height,
-            src_pitch,
-            0,
-            0,
-            width,
-            height,
-            4,
-        )
-    }
-
-    unsafe fn upload_texture_region(
-        &mut self,
-        texture_id: TextureId,
-        data: &[u8],
-        width: u32,
-        height: u32,
-        src_pitch: usize,
-        x: u32,
-        y: u32,
-        w: u32,
-        h: u32,
-        bpp: usize,
-    ) -> Result<()> {
         let texture = &self.textures[texture_id.id()];
         if texture.width != width || texture.height != height {
             error!(
@@ -593,38 +569,22 @@ impl TextureHeap {
         }
 
         let mut r: D3DLOCKED_RECT = Default::default();
-        let rect = RECT {
-            left: x as i32,
-            top: y as i32,
-            right: (x + w) as i32,
-            bottom: (y + h) as i32,
-        };
-        texture.resource.LockRect(0, &mut r, &rect, 0)?;
+        texture.resource.LockRect(0, &mut r, ptr::null_mut(), 0)?;
 
         let bits = r.pBits as *mut u8;
-        let dst_pitch = r.Pitch as usize;
-        let region_height = h as usize;
-        let region_width = w as usize;
+        let pitch = r.Pitch as usize;
+        let height = height as usize;
+        let width = width as usize;
 
         // CPU swizzle FTW
-        for row in 0..region_height {
-            let src_row = (y as usize + row) * src_pitch;
-            let dst_row = row * dst_pitch;
-            for col in 0..region_width {
-                let offset_dest = dst_row + col * 4;
-                let src_offset = src_row + ((x as usize + col) * bpp);
-                if bpp == 1 {
-                    let a = data[src_offset];
-                    *bits.add(offset_dest) = 255;
-                    *bits.add(offset_dest + 1) = 255;
-                    *bits.add(offset_dest + 2) = 255;
-                    *bits.add(offset_dest + 3) = a;
-                } else {
-                    *bits.add(offset_dest) = data[src_offset + 2];
-                    *bits.add(offset_dest + 1) = data[src_offset + 1];
-                    *bits.add(offset_dest + 2) = data[src_offset];
-                    *bits.add(offset_dest + 3) = data[src_offset + 3];
-                }
+        for y in 0..height {
+            for x in 0..width {
+                let offset_dest = pitch * y + x * 4;
+                let offset_src = width * 4 * y + x * 4;
+                *bits.add(offset_dest) = data[offset_src + 2];
+                *bits.add(offset_dest + 1) = data[offset_src + 1];
+                *bits.add(offset_dest + 2) = data[offset_src];
+                *bits.add(offset_dest + 3) = data[offset_src + 3];
             }
         }
 

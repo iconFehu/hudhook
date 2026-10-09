@@ -5,7 +5,7 @@ use std::mem::{self, offset_of};
 
 use gl::types::*;
 use imgui::internal::{RawCast, RawWrapper};
-use imgui::{sys, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
+use imgui::{sys, BackendFlags, Context, DrawCmd, DrawData, DrawIdx, DrawVert, TextureId};
 use once_cell::sync::OnceCell;
 use tracing::error;
 use windows::core::{s, Error, Result, HRESULT, PCSTR};
@@ -82,6 +82,8 @@ impl OpenGl3RenderEngine {
         let texture_heap = TextureHeap::new();
 
         ctx.set_ini_filename(None);
+        ctx.io_mut().backend_flags |= BackendFlags::RENDERER_HAS_VTX_OFFSET
+            | BackendFlags::RENDERER_HAS_TEXTURES;
         ctx.set_renderer_name(String::from(concat!("hudhook-opengl3@", env!("CARGO_PKG_VERSION"))));
 
         Ok(Self {
@@ -130,22 +132,22 @@ impl RenderEngine for OpenGl3RenderEngine {
     }
 
     fn setup_fonts(&mut self, ctx: &mut Context) -> Result<()> {
+        // With Dear ImGui 1.92+ dynamic textures (BackendFlags::RENDERER_HAS_TEXTURES),
+        // the font atlas is built on-demand through ImTextureData system.
+        // We only need to set up the TexData pointer and initial status.
         let fonts = ctx.fonts();
-        let fonts_texture = fonts.build_rgba32_texture();
-        let texture_id =
-            self.load_texture(fonts_texture.data, fonts_texture.width, fonts_texture.height)?;
         let fonts_raw = fonts as *const _ as *mut sys::ImFontAtlas;
         let tex_data = unsafe { (*fonts_raw).TexData };
+        
+        // ImGui will request texture creation via ImTextureStatus_WantCreate
+        // in update_textures() when the atlas is actually needed
         if !tex_data.is_null() {
             unsafe {
-                sys::ImTextureData_SetTexID(tex_data, texture_id.id() as sys::ImTextureID);
-                sys::ImTextureData_SetStatus(tex_data, sys::ImTextureStatus_OK);
+                // Mark as needing creation - update_textures will handle it
+                sys::ImTextureData_SetStatus(tex_data, sys::ImTextureStatus_WantCreate);
             }
         }
-        fonts.tex_ref = sys::ImTextureRef {
-            _TexData: tex_data,
-            _TexID: texture_id.id() as sys::ImTextureID,
-        };
+        
         Ok(())
     }
 
